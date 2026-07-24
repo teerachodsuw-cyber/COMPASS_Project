@@ -1,0 +1,7 @@
+# Dynamic-DeepHit hyperparameters — TBD, placeholder structure only,
+# to be filled in when this model is implemented.
+
+hidden_dim: 64        # placeholder
+num_layers: 2         # placeholder
+learning_rate: 0.001  # placeholder
+batch_size: 128        # placeholder

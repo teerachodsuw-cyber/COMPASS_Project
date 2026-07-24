@@ -1,0 +1,60 @@
+# Schema confirmed from Siriraj data dictionary, 2026-07-24.
+# Update this file, not hardcoded values elsewhere, if the real schema differs
+# once Stage 1 data audit runs.
+
+continuous_variables:
+  - {name: index_age, unit: years}
+  - {name: height, unit: cm}
+  - {name: weight, unit: kg}
+  - {name: bmi, unit: kg/m2}
+  - {name: dbp, unit: mmHg}
+  - {name: sbp, unit: mmHg}
+  - {name: fbs, unit: mg/dL}
+  - {name: hba1c, unit: percent}
+  - {name: cholesterol, unit: mg/dL}
+  - {name: triglyceride, unit: mg/dL}
+  - {name: hdl_cholesterol, unit: mg/dL}
+  - {name: ldl_cholesterol, unit: mg/dL}
+  - {name: plt, unit: "10^3/uL"}
+  - {name: crcl, unit: "mL/min"}
+  - {name: egfr, unit: "mL/min/1.73m2"}
+  - {name: alt, unit: U/L}
+  - {name: ast, unit: U/L}
+  - {name: e_median, unit: kPa, description: "FibroScan liver stiffness measurement (LSM)"}
+  - {name: cap_median, unit: dB/m, description: "FibroScan controlled attenuation parameter (CAP)"}
+
+medication_flags:  # all binary, confirmed prevalence noted as comments for synthetic generation later
+  - {name: metformin, prevalence: 0.596}
+  - {name: sulfonylureas, prevalence: 0.269}
+  - {name: pioglitazone, prevalence: 0.110}
+  - {name: insulin, prevalence: 0.104}
+  - {name: dpp4, prevalence: 0.106}
+  - {name: glp1, prevalence: 0.006}
+  - {name: sglt2, prevalence: 0.026}
+  - {name: acei, prevalence: 0.159}
+  - {name: arb, prevalence: 0.275}
+  - {name: arni, prevalence: 0.002}
+  - {name: statins, prevalence: 0.516}
+  - {name: fibrate, prevalence: 0.072}
+  - {name: ezetimibe, prevalence: 0.045}
+
+demographics:
+  - {name: sex, type: categorical, values: [male, female]}
+  - {name: smoking_status, type: categorical, values: [1, 2, 3, 4]}
+
+outcomes:
+  - {name: mortality, type: time_to_event, role: primary}
+  - {name: malo, type: time_to_event, role: secondary, note: "composite: hepatic decompensation, cirrhosis, HCC, liver transplant, liver-related death"}
+  - {name: cvd, type: time_to_event, role: secondary, note: "composite: MI, stroke, CV death"}
+
+censoring:
+  administrative_cutoff: "2025-06-30"
+  structure: semi_competing_risks
+  rule: "mortality censors both MALO and CVD if it occurs first; MALO and CVD do not censor each other"
+
+cohort:
+  n_confirmed: 12667
+  n_broader_t2dm_registry: 18000
+  site: single_center
+  institution: "Siriraj Hospital, Mahidol University"
+  date_range: ["2013-06-01", "2025-06-30"]

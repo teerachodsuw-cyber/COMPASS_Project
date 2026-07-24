@@ -1,0 +1,23 @@
+# Placeholder structure only — values are TBD until Stage 1 real-data audit.
+# The keys below establish the shape of the training config; do not treat
+# any value here as final.
+
+horizons:
+  primary: 10  # years
+  secondary: [20, 30]
+  discretization_method: "quantile_grid"  # TBD exact cutpoints, deferred to Stage 1
+
+splitting:
+  method: "patient_level_stratified"
+  stratify_on: "joint_primary_secondary_event_status"
+  train_frac: 0.7
+  val_frac: 0.15
+  test_frac: 0.15
+
+landmarking:
+  sampling: "one_random_landmark_per_subject_per_epoch"
+
+loss:
+  class_imbalance_handling: "inverse_frequency_weighting"
+
+seed: 42  # deterministic seed — fixed from day one, unlike the prior project
