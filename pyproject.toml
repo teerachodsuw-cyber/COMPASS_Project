@@ -16,6 +16,7 @@ dependencies = [
     "pyyaml",
     "lifelines",
     "matplotlib",
+    "iterative-stratification",
 ]
 
 [project.optional-dependencies]
