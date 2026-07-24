@@ -3,25 +3,25 @@
 # once Stage 1 data audit runs.
 
 continuous_variables:
-  - {name: index_age, unit: years}
-  - {name: height, unit: cm}
-  - {name: weight, unit: kg}
-  - {name: bmi, unit: kg/m2}
-  - {name: dbp, unit: mmHg}
-  - {name: sbp, unit: mmHg}
-  - {name: fbs, unit: mg/dL}
-  - {name: hba1c, unit: percent}
-  - {name: cholesterol, unit: mg/dL}
-  - {name: triglyceride, unit: mg/dL}
-  - {name: hdl_cholesterol, unit: mg/dL}
-  - {name: ldl_cholesterol, unit: mg/dL}
-  - {name: plt, unit: "10^3/uL"}
-  - {name: crcl, unit: "mL/min"}
-  - {name: egfr, unit: "mL/min/1.73m2"}
-  - {name: alt, unit: U/L}
-  - {name: ast, unit: U/L}
-  - {name: e_median, unit: kPa, description: "FibroScan liver stiffness measurement (LSM)"}
-  - {name: cap_median, unit: dB/m, description: "FibroScan controlled attenuation parameter (CAP)"}
+  - {name: index_age, unit: years, mean: 63.97, sd: 13.10, missing_rate: 0.0000}
+  - {name: height, unit: cm, mean: 154.27, sd: 7.94, missing_rate: 0.0093}
+  - {name: weight, unit: kg, mean: 61.84, sd: 11.43, missing_rate: 0.0093}
+  - {name: bmi, unit: kg/m2, mean: 25.93, sd: 4.27, missing_rate: 0.0093}
+  - {name: dbp, unit: mmHg, mean: 76.56, sd: 11.48, missing_rate: 0.0099}
+  - {name: sbp, unit: mmHg, mean: 132.21, sd: 17.64, missing_rate: 0.0099}
+  - {name: fbs, unit: mg/dL, mean: 135.76, sd: 56.82, missing_rate: 0.0024}
+  - {name: hba1c, unit: percent, mean: 6.80, sd: 1.41, missing_rate: 0.0034}
+  - {name: cholesterol, unit: mg/dL, mean: 168.49, sd: 45.10, missing_rate: 0.0039}
+  - {name: triglyceride, unit: mg/dL, mean: 137.82, sd: 87.00, missing_rate: 0.0038}
+  - {name: hdl_cholesterol, unit: mg/dL, mean: 51.39, sd: 16.03, missing_rate: 0.0039}
+  - {name: ldl_cholesterol, unit: mg/dL, mean: 91.63, sd: 36.77, missing_rate: 0.0036}
+  - {name: plt, unit: "10^3/uL", mean: 243.21, sd: 100.55, missing_rate: 0.0018}
+  - {name: crcl, unit: "mL/min", mean: 1.33, sd: 1.46, missing_rate: 0.0013}
+  - {name: egfr, unit: "mL/min/1.73m2", mean: 71.16, sd: 29.26, missing_rate: 0.0013}
+  - {name: alt, unit: U/L, mean: 35.62, sd: 106.00, missing_rate: 0.0021}
+  - {name: ast, unit: U/L, mean: 42.74, sd: 133.18, missing_rate: 0.0021}
+  - {name: e_median, unit: kPa, description: "FibroScan liver stiffness measurement (LSM)", mean: 10.96, sd: 11.88, missing_rate: 0.9500}
+  - {name: cap_median, unit: dB/m, description: "FibroScan controlled attenuation parameter (CAP)", mean: 216.98, sd: 92.87, missing_rate: 0.9700}
 
 medication_flags:  # all binary, confirmed prevalence noted as comments for synthetic generation later
   - {name: metformin, prevalence: 0.4041}
