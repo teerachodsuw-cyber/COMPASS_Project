@@ -24,22 +24,22 @@ continuous_variables:
   - {name: cap_median, unit: dB/m, description: "FibroScan controlled attenuation parameter (CAP)"}
 
 medication_flags:  # all binary, confirmed prevalence noted as comments for synthetic generation later
-  - {name: metformin, prevalence: 0.596}
-  - {name: sulfonylureas, prevalence: 0.269}
-  - {name: pioglitazone, prevalence: 0.110}
-  - {name: insulin, prevalence: 0.104}
-  - {name: dpp4, prevalence: 0.106}
-  - {name: glp1, prevalence: 0.006}
-  - {name: sglt2, prevalence: 0.026}
-  - {name: acei, prevalence: 0.159}
-  - {name: arb, prevalence: 0.275}
-  - {name: arni, prevalence: 0.002}
-  - {name: statins, prevalence: 0.516}
-  - {name: fibrate, prevalence: 0.072}
-  - {name: ezetimibe, prevalence: 0.045}
+  - {name: metformin, prevalence: 0.4041}
+  - {name: sulfonylureas, prevalence: 0.2688}
+  - {name: pioglitazone, prevalence: 0.1103}
+  - {name: insulin, prevalence: 0.1043}
+  - {name: dpp4, prevalence: 0.1061}
+  - {name: glp1, prevalence: 0.0060}
+  - {name: sglt2, prevalence: 0.0259}
+  - {name: acei, prevalence: 0.1592}
+  - {name: arb, prevalence: 0.2753}
+  - {name: arni, prevalence: 0.0018}
+  - {name: statins, prevalence: 0.5165}
+  - {name: fibrate, prevalence: 0.0716}
+  - {name: ezetimibe, prevalence: 0.0454}
 
 demographics:
-  - {name: sex, type: categorical, values: [male, female]}
+  - {name: sex, type: categorical, values: [male, female]}  # confirmed proportions: male 0.4710, female 0.5290
   - {name: smoking_status, type: categorical, values: [1, 2, 3, 4]}
 
 outcomes:
