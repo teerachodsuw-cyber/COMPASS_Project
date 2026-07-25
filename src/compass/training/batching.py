@@ -7,8 +7,15 @@ occurs first; malo and cvd do not censor each other.
 Also computes `elapsed_days` (batch, seq_len): days since the previous visit (0 for each
 patient's first visit), from each example's raw `input_visits["visit_date"]`. This is
 generic, model-agnostic timing info -- computed here once so any architecture that needs
-real elapsed time (currently TRACER; Dynamic-DeepHit ignores it) doesn't have to re-derive
-it from raw dates itself.
+real elapsed time (currently TRACER, SurvLatentODE; Dynamic-DeepHit ignores it) doesn't have
+to re-derive it from raw dates itself.
+
+Also exposes each outcome's continuous-time target as `{name}_target_days` (days from
+landmark to that outcome's event time if it occurred, else its censoring time under the
+same per-outcome censoring rule) -- SurvLatentODE's continuous-time loss needs this instead
+of a discrete bin index. It is not new computation: `event_time_for_bin`/`censor_years`
+below are already derived for the discrete-bin targets; this just also exposes that same
+value in days rather than only converting it to a bin index.
 """
 
 import numpy as np
@@ -105,5 +112,6 @@ def collate_examples(
         batch[f"{name}_event_indicator"] = torch.tensor(event_in_followup.astype(np.float32))
         batch[f"{name}_event_bin"] = years_to_bin_index(torch.tensor(event_time_for_bin), bin_width_years, num_time_bins)
         batch[f"{name}_censoring_bin"] = years_to_bin_index(torch.tensor(censor_years), bin_width_years, num_time_bins)
+        batch[f"{name}_target_days"] = torch.tensor(event_time_for_bin * 365.25, dtype=torch.float32)
 
     return batch

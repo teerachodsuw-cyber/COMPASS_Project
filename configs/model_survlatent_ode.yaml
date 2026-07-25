@@ -1,7 +1,27 @@
-# SurvLatent ODE hyperparameters — TBD, placeholder structure only,
-# to be filled in when this model is implemented.
+# SurvLatent ODE hyperparameters — TBD, placeholder structure only.
+# Architecture is implemented (src/compass/models/survlatent_ode/); values below are
+# reasonable starting points for synthetic-data development, not tuned.
 
-hidden_dim: 64        # placeholder
-num_layers: 2         # placeholder
-learning_rate: 0.001  # placeholder
-batch_size: 128        # placeholder
+latent_dim: 16           # placeholder
+ode_hidden_dim: 32       # placeholder (MLP hidden size for dh/dt = f(h))
+cause_head_hidden_dim: 16  # placeholder
+learning_rate: 0.001     # placeholder
+batch_size: 64           # placeholder (smaller than the other two models' default 128 --
+                          # ODE solves are more expensive per example than a GRU/attention step)
+
+# ODE solver. dopri5 = adaptive Dormand-Prince (accuracy-adaptive step size); direct
+# (non-adjoint) backprop through the solver -- see model.py docstring for why: sequences
+# here are short and small, so the adjoint method's memory savings aren't needed, and direct
+# autodiff gives exact gradients through the actual solver steps rather than the adjoint's
+# separately-solved backward-time ODE.
+solver_method: dopri5    # placeholder; 'rk4' (fixed-step) is a faster alternative if needed
+
+# Discrete-time comparison interface only (see hazards_at_bins() in model.py) -- the model
+# itself is continuous internally. Same yearly-bin scheme as Dynamic-DeepHit/TraCeR for
+# comparability. Exact cutpoints deferred to Stage 1.
+num_time_bins: 30       # placeholder
+bin_width_years: 1.0    # placeholder
+
+# No ranking_weight / auxiliary_weight -- like TraCeR, SurvLatent ODE's loss is just the sum
+# of three independent per-outcome continuous-time NLLs (inverse-frequency weighted).
+# Nothing else.
