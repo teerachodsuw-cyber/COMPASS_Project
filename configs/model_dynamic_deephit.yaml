@@ -1,7 +1,19 @@
-# Dynamic-DeepHit hyperparameters — TBD, placeholder structure only,
-# to be filled in when this model is implemented.
+# Dynamic-DeepHit hyperparameters — TBD, placeholder structure only.
+# Architecture is implemented (src/compass/models/dynamic_deephit/); values below are
+# reasonable starting points for synthetic-data development, not tuned.
 
-hidden_dim: 64        # placeholder
-num_layers: 2         # placeholder
-learning_rate: 0.001  # placeholder
+hidden_dim: 64         # placeholder
+num_layers: 2          # placeholder (GRU layers)
+cause_head_hidden_dim: 32  # placeholder
+learning_rate: 0.001   # placeholder
 batch_size: 128        # placeholder
+
+# Discrete-time hazard binning. PLACEHOLDER: simple yearly bins, not the locked
+# "quantile_grid" method (configs/training.yaml) -- exact cutpoints deferred to Stage 1.
+num_time_bins: 30      # placeholder, covers up to 30yr follow-up (longest reporting horizon)
+bin_width_years: 1.0   # placeholder
+
+# Loss weights: total = survival_nll + ranking_weight * ranking_loss +
+# auxiliary_weight * auxiliary_loss. Flagged as reasonable starting points, not tuned.
+ranking_weight: 0.1    # placeholder (alpha)
+auxiliary_weight: 0.1  # placeholder (beta)

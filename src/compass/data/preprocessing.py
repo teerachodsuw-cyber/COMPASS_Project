@@ -7,6 +7,8 @@ correctness:
 4. fit_scalers() using ONLY the training split's observed values
 5. apply_scalers() then apply_masking(), in that order, applied to train/val/test alike
    using the training-fit scalers
+6. fold continuous + medication + demographic features into ONE combined feature tensor per
+   visit, in a fixed, documented order (see build_feature_names())
 """
 
 from dataclasses import dataclass
@@ -20,13 +22,70 @@ from compass.data.scaling import apply_scalers, fit_scalers
 from compass.data.splitting import patient_level_split
 
 
+def build_feature_names(
+    continuous_columns: list[str],
+    medication_columns: list[str],
+    sex_categories: tuple,
+    smoking_status_categories: list,
+) -> list[str]:
+    """The single, canonical feature ordering every model must agree on: continuous
+    variables, then medication flags, then a binary sex indicator, then one-hot
+    smoking_status. sex_categories must have exactly 2 values; the indicator is 1 iff sex
+    == sex_categories[1] (e.g. ("male", "female") -> a "sex_female" column).
+    """
+    if len(sex_categories) != 2:
+        raise ValueError(f"sex_categories must have exactly 2 values, got {sex_categories}")
+    sex_column = f"sex_{sex_categories[1]}"
+    smoking_columns = [f"smoking_status_{c}" for c in smoking_status_categories]
+    return list(continuous_columns) + list(medication_columns) + [sex_column] + smoking_columns
+
+
+def _encode_medication_and_demographic_features(
+    df: pd.DataFrame,
+    medication_columns: list[str],
+    sex_categories: tuple,
+    smoking_status_categories: list,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Encode medication flags + demographics into (values_df, mask_df), matching the
+    continuous-variable convention: mask=1 where observed, 0 where missing; missing values
+    are zero-filled. Medication/demographic features are only ever missing if the source
+    data actually has a null there (checked explicitly below, not assumed impossible).
+    """
+    med_values = df[medication_columns].fillna(0.0).astype(float)
+    med_mask = df[medication_columns].notna().astype(int)
+
+    sex_column = f"sex_{sex_categories[1]}"
+    sex_observed = df["sex"].notna()
+    sex_indicator = (df["sex"] == sex_categories[1]).astype(float)
+    sex_indicator[~sex_observed] = 0.0
+    sex_values = sex_indicator.to_frame(sex_column)
+    sex_mask = sex_observed.astype(int).to_frame(sex_column)
+
+    smoking_observed = df["smoking_status"].notna()
+    smoking_columns = [f"smoking_status_{c}" for c in smoking_status_categories]
+    smoking_values = pd.DataFrame(
+        {f"smoking_status_{c}": (df["smoking_status"] == c).astype(float) for c in smoking_status_categories},
+        index=df.index,
+    )
+    smoking_values.loc[~smoking_observed, :] = 0.0
+    smoking_mask = pd.DataFrame(
+        {col: smoking_observed.astype(int) for col in smoking_columns},
+        index=df.index,
+    )
+
+    values = pd.concat([med_values, sex_values, smoking_values], axis=1)
+    mask = pd.concat([med_mask, sex_mask, smoking_mask], axis=1)
+    return values, mask
+
+
 @dataclass
 class PreprocessedData:
     """Bundled, model-ready train/val/test data.
 
     train/val/test are each a list of per-patient landmark examples: dicts with
-    patient_id, landmark_date, input_visits (raw), input_values (scaled + zero-filled),
-    input_mask (1=observed/0=missing), and outcome_labels ({outcome: {horizon: 0/1}}).
+    patient_id, landmark_date, input_visits (raw), input_values (scaled/encoded +
+    zero-filled, columns in feature_names order), input_mask (1=observed/0=missing, same
+    column order), and outcome_labels ({outcome: {horizon: 0/1}}).
     """
 
     train: list[dict]
@@ -34,6 +93,7 @@ class PreprocessedData:
     test: list[dict]
     scalers: dict
     continuous_columns: list[str]
+    feature_names: list[str]
     horizons: list[int]
 
 
@@ -41,6 +101,9 @@ def run_preprocessing(
     visits_df: pd.DataFrame,
     outcomes_df: pd.DataFrame,
     continuous_columns: list[str],
+    medication_columns: list[str],
+    sex_categories: tuple,
+    smoking_status_categories: list,
     horizons: list[int],
     train_frac: float,
     val_frac: float,
@@ -82,13 +145,22 @@ def run_preprocessing(
     train_mask_df = train_visits_concat[continuous_columns].notna().astype(int)
     scalers = fit_scalers(train_visits_concat, train_mask_df, continuous_columns)
 
+    feature_names = build_feature_names(continuous_columns, medication_columns, sex_categories, smoking_status_categories)
+
     def _scale_and_mask(examples: list[dict]) -> list[dict]:
         if not examples:
             return []
         concat = pd.concat([ex["input_visits"] for ex in examples], ignore_index=True)
         mask_source = concat[continuous_columns].notna().astype(int)
         scaled = apply_scalers(concat, mask_source, scalers, continuous_columns)
-        values_df, mask_df = apply_masking(scaled, continuous_columns)
+        cont_values_df, cont_mask_df = apply_masking(scaled, continuous_columns)
+
+        other_values_df, other_mask_df = _encode_medication_and_demographic_features(
+            concat, medication_columns, sex_categories, smoking_status_categories
+        )
+
+        full_values = pd.concat([cont_values_df[continuous_columns], other_values_df], axis=1)[feature_names]
+        full_mask = pd.concat([cont_mask_df[continuous_columns], other_mask_df], axis=1)[feature_names]
 
         processed = []
         pos = 0
@@ -97,8 +169,8 @@ def run_preprocessing(
             processed.append(
                 {
                     **ex,
-                    "input_values": values_df.iloc[pos : pos + n].reset_index(drop=True),
-                    "input_mask": mask_df.iloc[pos : pos + n].reset_index(drop=True),
+                    "input_values": full_values.iloc[pos : pos + n].reset_index(drop=True),
+                    "input_mask": full_mask.iloc[pos : pos + n].reset_index(drop=True),
                 }
             )
             pos += n
@@ -110,5 +182,6 @@ def run_preprocessing(
         test=_scale_and_mask(test_examples),
         scalers=scalers,
         continuous_columns=list(continuous_columns),
+        feature_names=feature_names,
         horizons=list(horizons),
     )
