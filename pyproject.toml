@@ -17,6 +17,7 @@ dependencies = [
     "lifelines",
     "matplotlib",
     "iterative-stratification",
+    "scikit-survival",
 ]
 
 [project.optional-dependencies]
