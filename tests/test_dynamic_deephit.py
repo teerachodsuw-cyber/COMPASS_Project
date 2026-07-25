@@ -18,11 +18,14 @@ from compass.training.batching import collate_examples
 
 
 def _make_example(patient_id: str, landmark_date: pd.Timestamp, num_features: int = 3) -> dict:
+    landmark_date = pd.Timestamp(landmark_date)
     input_values = pd.DataFrame(np.zeros((1, num_features)), columns=[f"f{i}" for i in range(num_features)])
     input_mask = pd.DataFrame(np.ones((1, num_features)), columns=[f"f{i}" for i in range(num_features)])
+    input_visits = pd.DataFrame({"patient_id": [patient_id], "visit_date": [landmark_date]})
     return {
         "patient_id": patient_id,
-        "landmark_date": pd.Timestamp(landmark_date),
+        "landmark_date": landmark_date,
+        "input_visits": input_visits,
         "input_values": input_values,
         "input_mask": input_mask,
     }

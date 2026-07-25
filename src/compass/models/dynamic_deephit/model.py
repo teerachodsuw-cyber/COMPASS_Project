@@ -97,7 +97,16 @@ class DynamicDeepHitModel(CompassSurvivalModel):
     def _hazards_from_context(self, context: torch.Tensor) -> dict[str, torch.Tensor]:
         return {name: torch.sigmoid(head(context)) for name, head in self.cause_heads.items()}
 
-    def forward(self, values: torch.Tensor, mask: torch.Tensor, seq_lengths: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        seq_lengths: torch.Tensor,
+        elapsed_days: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        # elapsed_days accepted for interface consistency with base.py but unused here --
+        # the GRU's sequence order already captures temporal structure for this
+        # architecture; see base.py for why TRACER needs it and Dynamic-DeepHit doesn't.
         context, _, _ = self._encode(values, mask, seq_lengths)
         return self._hazards_from_context(context)
 

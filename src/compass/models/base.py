@@ -42,6 +42,13 @@ class CompassSurvivalModel(nn.Module, ABC):
     - values: (batch, seq_len, num_features) float tensor, scaled + zero-filled
     - mask: (batch, seq_len, num_features) float tensor, 1=observed 0=missing
     - seq_lengths: (batch,) int tensor, actual (unpadded) sequence length per patient
+    - elapsed_days: (batch, seq_len) float tensor, OPTIONAL (default None). Days since the
+      previous visit (0 for each patient's first visit), from
+      compass.training.batching.collate_examples. Added for TRACER, whose factorized
+      temporal attention and time-decay missingness gate need real elapsed time between
+      irregularly-spaced visits, not just sequence position. Models that don't need it
+      (Dynamic-DeepHit) accept and ignore it -- this keeps the shared signature stable
+      across all three architectures rather than giving TRACER a different one.
 
     Output contract (all models must implement):
     - forward(...) -> dict with exactly three keys "mortality", "malo", "cvd", each
@@ -67,6 +74,7 @@ class CompassSurvivalModel(nn.Module, ABC):
         values: torch.Tensor,
         mask: torch.Tensor,
         seq_lengths: torch.Tensor,
+        elapsed_days: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         raise NotImplementedError
 
@@ -99,11 +107,12 @@ class CompassSurvivalModel(nn.Module, ABC):
         mask: torch.Tensor,
         seq_lengths: torch.Tensor,
         horizons: list[int],
+        elapsed_days: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """forward() + hazards_to_cif() for each outcome, stacked into
         (batch, 3, len(horizons)) -- the method evaluation/comparison code actually calls.
         """
-        hazards_by_outcome = self.forward(values, mask, seq_lengths)
+        hazards_by_outcome = self.forward(values, mask, seq_lengths, elapsed_days)
         horizon_bins = [self.years_to_bin_index(h) for h in horizons]
         cifs = [self.hazards_to_cif(hazards_by_outcome[name], horizon_bins) for name in OUTCOME_NAMES]
         return torch.stack(cifs, dim=1)

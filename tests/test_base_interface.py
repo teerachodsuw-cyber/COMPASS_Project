@@ -16,7 +16,7 @@ class _DummyModel(CompassSurvivalModel):
         self.bin_width_years = bin_width_years
         self.linear = torch.nn.Linear(1, 1)
 
-    def forward(self, values, mask, seq_lengths):
+    def forward(self, values, mask, seq_lengths, elapsed_days=None):
         batch = values.shape[0]
         # Deterministic, valid-probability dummy hazard per outcome.
         hazard = torch.full((batch, self.num_time_bins), 0.05)

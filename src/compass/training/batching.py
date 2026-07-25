@@ -3,6 +3,12 @@ discrete-time hazard targets (event_indicator, event_bin, censoring_bin) from ra
 landmark/outcome data -- applying this project's locked semi-competing-risks censoring
 rule (configs/data_schema.yaml: censoring.rule): mortality censors both malo and cvd if it
 occurs first; malo and cvd do not censor each other.
+
+Also computes `elapsed_days` (batch, seq_len): days since the previous visit (0 for each
+patient's first visit), from each example's raw `input_visits["visit_date"]`. This is
+generic, model-agnostic timing info -- computed here once so any architecture that needs
+real elapsed time (currently TRACER; Dynamic-DeepHit ignores it) doesn't have to re-derive
+it from raw dates itself.
 """
 
 import numpy as np
@@ -35,10 +41,16 @@ def collate_examples(
 
     values = torch.zeros(batch_size, max_len, num_features, dtype=torch.float32)
     mask = torch.zeros(batch_size, max_len, num_features, dtype=torch.float32)
+    elapsed_days = torch.zeros(batch_size, max_len, dtype=torch.float32)
     for i, ex in enumerate(examples):
         n = len(ex["input_values"])
         values[i, :n] = torch.tensor(ex["input_values"].to_numpy(), dtype=torch.float32)
         mask[i, :n] = torch.tensor(ex["input_mask"].to_numpy(), dtype=torch.float32)
+
+        visit_dates = pd.to_datetime(ex["input_visits"]["visit_date"]).to_numpy()
+        if n > 1:
+            gaps_days = np.diff(visit_dates).astype("timedelta64[D]").astype(np.float32)
+            elapsed_days[i, 1:n] = torch.tensor(gaps_days)
 
     outcomes_indexed = outcomes_df.set_index("patient_id")
     landmark_dates = [ex["landmark_date"] for ex in examples]
@@ -57,7 +69,12 @@ def collate_examples(
         dtype=np.float32,
     )
 
-    batch: dict[str, torch.Tensor] = {"values": values, "mask": mask, "seq_lengths": seq_lengths}
+    batch: dict[str, torch.Tensor] = {
+        "values": values,
+        "mask": mask,
+        "seq_lengths": seq_lengths,
+        "elapsed_days": elapsed_days,
+    }
 
     for name in OUTCOME_NAMES:
         event_flag = outcome_rows[f"{name}_event"].to_numpy().astype(int)

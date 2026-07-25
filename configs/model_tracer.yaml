@@ -1,7 +1,26 @@
-# TRACER hyperparameters — TBD, placeholder structure only,
-# to be filled in when this model is implemented.
+# TRACER hyperparameters — TBD, placeholder structure only.
+# Architecture is implemented (src/compass/models/tracer/); values below are reasonable
+# starting points for synthetic-data development, not tuned.
 
-hidden_dim: 64        # placeholder
-num_layers: 2         # placeholder
-learning_rate: 0.001  # placeholder
-batch_size: 128        # placeholder
+feature_embed_dim: 16       # placeholder, per-feature embedding dim for covariate attention
+covariate_attention_heads: 2  # placeholder
+hidden_dim: 64               # placeholder, per-timestep dim after covariate pooling
+temporal_attention_heads: 4  # placeholder
+num_transformer_layers: 2    # placeholder (temporal transformer stack depth)
+cause_head_hidden_dim: 32    # placeholder
+dropout: 0.1                 # placeholder
+learning_rate: 0.001         # placeholder
+batch_size: 128              # placeholder
+
+# Discrete-time hazard binning -- same placeholder yearly scheme as Dynamic-DeepHit, for
+# comparability between the two. Exact cutpoints deferred to Stage 1.
+num_time_bins: 30       # placeholder
+bin_width_years: 1.0    # placeholder
+
+# Time-decay missingness gate (TRACER's native mechanism, replaces mask+zero-fill):
+# weight = exp(-time_since_last_observed_days / tau), tau learnable per feature.
+max_staleness_days: 3650.0  # placeholder (~10yr), cap for "never observed" sentinel
+
+# No ranking_weight / auxiliary_weight here -- unlike Dynamic-DeepHit, TRACER's loss is
+# just the sum of three independent per-outcome discrete-time NLLs (inverse-frequency
+# weighted). Nothing else.

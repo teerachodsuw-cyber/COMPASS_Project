@@ -5,55 +5,17 @@ across causes is not valid here).
 Each function operates on ONE outcome's hazard sequence/targets at a time. The model's
 compute_loss() calls discrete_time_survival_nll() and ranking_loss() once per outcome and
 sums the results; auxiliary_prediction_loss() is shared (not outcome-specific).
+
+discrete_time_survival_nll() itself now lives in compass.training.survival_losses (shared
+with TRACER, which uses the identical computation) -- re-exported here so existing imports
+(`from compass.models.dynamic_deephit.losses import discrete_time_survival_nll`) keep working.
 """
 
 import torch
 
+from compass.training.survival_losses import discrete_time_survival_nll
 
-def discrete_time_survival_nll(
-    hazard: torch.Tensor,
-    event_indicator: torch.Tensor,
-    event_bin: torch.Tensor,
-    censoring_bin: torch.Tensor,
-) -> torch.Tensor:
-    """Discrete-time survival negative log-likelihood for ONE outcome's independent hazard
-    sequence, averaged over the batch.
-
-    - event_indicator=1 (event occurred): likelihood = hazard[event_bin] *
-      prod_{k<event_bin}(1-hazard[k]).
-    - event_indicator=0 (censored): likelihood = prod_{k<=censoring_bin}(1-hazard[k]).
-
-    Callers must supply event_bin/censoring_bin already adjusted for this project's
-    per-outcome censoring rule (see compass.training.batching.collate_examples): mortality
-    is censored at the administrative cutoff only; malo/cvd are censored at
-    min(administrative cutoff, mortality event time) if mortality occurred, since death
-    stops further risk-set exposure for the non-fatal outcomes -- independent of the OTHER
-    non-fatal outcome's status. This function itself is outcome-agnostic.
-
-    hazard: (batch, num_time_bins). event_indicator/event_bin/censoring_bin: (batch,).
-    """
-    eps = 1e-8
-    num_time_bins = hazard.shape[1]
-
-    log_survival = torch.log(torch.clamp(1.0 - hazard, min=eps))
-    cumulative_log_survival = torch.cumsum(log_survival, dim=1)  # log P(survive through bin t)
-
-    log_survival_strictly_before = torch.cat(
-        [torch.zeros(hazard.shape[0], 1, device=hazard.device), cumulative_log_survival[:, :-1]], dim=1
-    )
-
-    event_bin_clamped = event_bin.clamp(0, num_time_bins - 1)
-    log_hazard_at_event = torch.log(torch.clamp(hazard.gather(1, event_bin_clamped.unsqueeze(1)).squeeze(1), min=eps))
-    log_survival_before_event = log_survival_strictly_before.gather(1, event_bin_clamped.unsqueeze(1)).squeeze(1)
-    log_lik_event = log_hazard_at_event + log_survival_before_event
-
-    censoring_bin_clamped = censoring_bin.clamp(0, num_time_bins - 1)
-    log_lik_censored = cumulative_log_survival.gather(1, censoring_bin_clamped.unsqueeze(1)).squeeze(1)
-
-    event_indicator = event_indicator.float()
-    log_lik = event_indicator * log_lik_event + (1.0 - event_indicator) * log_lik_censored
-
-    return -log_lik.mean()
+__all__ = ["discrete_time_survival_nll", "ranking_loss", "auxiliary_prediction_loss"]
 
 
 def ranking_loss(
