@@ -18,6 +18,7 @@ dependencies = [
     "matplotlib",
     "iterative-stratification",
     "scikit-survival",
+    "comprisk",
 ]
 
 [project.optional-dependencies]

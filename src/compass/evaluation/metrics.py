@@ -76,6 +76,186 @@ def time_dependent_cindex(
     return float(result[0])
 
 
+def _censoring_ipcw_weights(event_time: np.ndarray, event_type_indicator: np.ndarray, cause_of_interest: int) -> np.ndarray:
+    """Per-patient Uno (2011) IPCW weight 1/G(t_i-)^2, where G is the Kaplan-Meier survival
+    of the CENSORING distribution -- i.e. a patient is only ever "censored" here if
+    event_type_indicator == 0 (true loss to follow-up). A competing event does NOT count as
+    censoring for this fit: the patient's outcome was fully observed (just not the cause of
+    interest), so it must not depress G the way an administrative dropout does.
+
+    This distinction matters and was found the hard way: `comprisk`'s own
+    compute_uno_weights folds competing events into its censoring-KM hazard (its own "events-
+    first" convention is about tie-breaking between cause-of-interest events and censoring,
+    not about excluding competing events), which inflates weights even when there is zero
+    real censoring before a case's event time -- confirmed to diverge from R's pec::cindex
+    (see wolbers_cindex's docstring). This standalone helper uses the correct convention
+    instead (verified against pec::cindex to give G==1, i.e. weight==1, whenever there is no
+    real censoring before a case's time -- the condition under which pec::cindex matches
+    exactly, see tests/test_r_reference_fixtures.py).
+
+    "Events-first" tie handling: at an exact tie between a cause-of-interest event and a
+    censoring event, the cause event is treated as leaving the risk set before the censoring
+    hazard is computed at that instant (removed from the denominator) -- the standard
+    convention for this kind of tie, though this specific choice was NOT the source of this
+    function's small residual disagreement with R on tied-time data (both orderings were
+    tried and gave identical results, see the wolbers_cindex docstring).
+    """
+    event_time = np.asarray(event_time, dtype=float)
+    is_cause = event_type_indicator == cause_of_interest
+    is_censored = event_type_indicator == 0
+    n = event_time.size
+
+    order = np.argsort(event_time, kind="stable")
+    cause_sorted = is_cause[order]
+    censored_sorted = is_censored[order]
+
+    t_unique, first_idx = np.unique(event_time[order], return_index=True)
+    bounds = np.append(first_idx, n)
+
+    g_at_knot = np.empty(t_unique.shape[0])
+    surv = 1.0
+    for k in range(t_unique.shape[0]):
+        s, e = int(bounds[k]), int(bounds[k + 1])
+        n_risk = n - s
+        d_cause = int(cause_sorted[s:e].sum())
+        d_censored = int(censored_sorted[s:e].sum())
+        denom = n_risk - d_cause
+        if d_censored > 0:
+            surv = 0.0 if denom <= 0 else surv * (1.0 - d_censored / denom)
+        g_at_knot[k] = surv
+
+    knot_idx = np.searchsorted(t_unique, event_time, side="left")
+    g_left = np.where(knot_idx > 0, g_at_knot[np.clip(knot_idx - 1, 0, None)], 1.0)
+    g_left_safe = np.maximum(g_left, 1e-12)
+    return 1.0 / (g_left_safe**2)
+
+
+def wolbers_cindex(
+    cif_at_horizon: np.ndarray,
+    event_type_indicator: np.ndarray,
+    event_time: np.ndarray,
+    horizon: float,
+    cause_of_interest: int = 1,
+) -> float:
+    """Wolbers et al. (2014, Biostatistics 15(3):526-539, eq. 3.4) cause-specific,
+    IPCW-weighted concordance index at `horizon`, correctly handling a real competing risk
+    (e.g. mortality for malo/cvd) rather than treating it as neutral censoring the way Uno's C
+    (time_dependent_cindex) does. Uno's C says a patient who died before malo/cvd could occur
+    has an "unknown fate, could still happen"; Wolbers' C-index knows their fate is
+    permanently precluded and scores accordingly.
+
+    event_type_indicator: integer code per patient -- 0 = censored (no event of any kind
+    observed), `cause_of_interest` = had the outcome of interest, any OTHER positive code =
+    had a competing event. These three cases are NOT interchangeable (see below).
+
+    Two kinds of comparator pairs for a case i (had the event of interest at or before
+    `horizon`), each with its own weight:
+    - "Branch A": event_time[j] > event_time[i], or a tie with j censored at exactly
+      event_time[i] -- j's fate wasn't yet decided as of i's event time (covers j later
+      having the same event, a later competing event, or later censoring). Weighted by
+      w_i alone (the standard Uno-style correction), since only i's own censoring risk
+      affects whether this pair could be observed.
+    - "Branch C": j had a COMPETING event at or before event_time[i] -- permanently
+      precludes the outcome of interest for j, so the pair is informative regardless of
+      time order. Weighted by sqrt(w_i * w_j) (symmetric: both i's and j's censoring risk
+      affect whether this pair could be observed, per Wolbers eq. 3.4).
+    - "Branch B": two or more cases tied at the exact same event_time -- each ordered pair
+      within the tied group gets half credit at minimum (weight w_i), full credit if their
+      predictions also tie.
+    Patients purely CENSORED strictly before i's event time are excluded from all branches
+    (their fate is genuinely unknown) -- this asymmetry between "competing event" and
+    "censored" is the whole point of the competing-risk correction, on top of the IPCW
+    weighting which corrects for the censoring itself.
+
+    Concordant if cif_at_horizon[i] > cif_at_horizon[j] (the model correctly scored the
+    patient who actually had the event as higher-risk); tied predictions get half credit.
+
+    w_i, w_j are computed via `_censoring_ipcw_weights` -- NOT `comprisk`'s own
+    compute_uno_weights, which was found to use a different (and, empirically, not
+    R-matching) convention; see that helper's docstring.
+
+    VERIFIED against R's pec::cindex (see tests/test_r_reference_fixtures.py): exact match
+    (6 decimal places) on two 300-patient cohorts with no censoring before the horizon
+    (case_a_malo, case_b_cvd -- where IPCW weights are trivially 1, so this also confirms the
+    prior no-IPCW version's pair-selection logic was already correct). On a 60-patient
+    deliberately-tied stress case with real censoring before the horizon (case_c_ties), this
+    reduced the gap from 0.0244 (no IPCW weighting at all) to 0.0009 (~96% closed) but did NOT
+    reach an exact match -- residual likely a tie-breaking convention difference in the
+    auxiliary censoring-KM fit versus R's `prodlim`/`pec` (tried both orderings for the
+    cause/censoring exact-time tie, no change), not further chased down as an unbounded
+    algorithm-archaeology exercise. Flagged, not hidden -- see the wider-tolerance note on
+    that fixture's test.
+
+    Returns NaN if there are no comparable pairs.
+    """
+    cif_at_horizon = np.asarray(cif_at_horizon, dtype=float)
+    event_type_indicator = np.asarray(event_type_indicator)
+    event_time = np.asarray(event_time, dtype=float)
+
+    is_case_at_horizon = (event_type_indicator == cause_of_interest) & (event_time <= horizon)
+    is_censored = event_type_indicator == 0
+    is_competing = (event_type_indicator != 0) & (event_type_indicator != cause_of_interest)
+
+    weights = _censoring_ipcw_weights(event_time, event_type_indicator, cause_of_interest)
+    sqrt_weights = np.sqrt(weights)
+
+    numerator = 0.0
+    denominator = 0.0
+    case_idx = np.flatnonzero(is_case_at_horizon)
+
+    for i in case_idx:
+        ti = event_time[i]
+        pi = cif_at_horizon[i]
+        wi = weights[i]
+
+        # Branch A.
+        mask_a = (event_time > ti) | ((event_time == ti) & is_censored)
+        mask_a[i] = False
+        if mask_a.any():
+            pj = cif_at_horizon[mask_a]
+            less = (pj < pi).sum()
+            tied = (pj == pi).sum()
+            n_pairs = mask_a.sum()
+            numerator += 2.0 * wi * less + wi * tied
+            denominator += 2.0 * wi * n_pairs
+
+        # Branch C.
+        mask_c = is_competing & (event_time <= ti)
+        if mask_c.any():
+            pj = cif_at_horizon[mask_c]
+            wj_sqrt = sqrt_weights[mask_c]
+            wi_sqrt = sqrt_weights[i]
+            less = (wj_sqrt * (pj < pi)).sum()
+            tied = (wj_sqrt * (pj == pi)).sum()
+            numerator += 2.0 * wi_sqrt * less + wi_sqrt * tied
+            denominator += 2.0 * wi_sqrt * wj_sqrt.sum()
+
+    # Branch B: tied case-times.
+    if case_idx.size >= 2:
+        order = np.argsort(event_time[case_idx], kind="stable")
+        sorted_case = case_idx[order]
+        sorted_t = event_time[sorted_case]
+        g0 = 0
+        while g0 < sorted_case.size:
+            g1 = g0
+            while g1 + 1 < sorted_case.size and sorted_t[g1 + 1] == sorted_t[g0]:
+                g1 += 1
+            group = sorted_case[g0 : g1 + 1]
+            if group.size >= 2:
+                for a in range(group.size):
+                    i = group[a]
+                    others = np.delete(group, a)
+                    wi = weights[i]
+                    tie_credit = 0.5 + 0.5 * (cif_at_horizon[others] == cif_at_horizon[i])
+                    numerator += wi * tie_credit.sum()
+                    denominator += wi * others.size
+            g0 = g1 + 1
+
+    if denominator == 0:
+        return float("nan")
+    return float(numerator / denominator)
+
+
 def integrated_brier_score_metric(
     cif_over_time: np.ndarray,
     event_indicator: np.ndarray,
@@ -171,8 +351,15 @@ def ipcw_calibration_curve(
 
 
 def compute_all_metrics(predictions: dict, ground_truth: dict, horizons: list) -> pd.DataFrame:
-    """Orchestrates time_dependent_cindex + integrated_brier_score_metric across all 3
-    outcomes x all horizons for ONE model's predictions.
+    """Orchestrates C-index + integrated_brier_score_metric across all 3 outcomes x all
+    horizons for ONE model's predictions.
+
+    C-index dispatch: mortality has no competing risk here -> time_dependent_cindex (Uno's
+    C), unchanged. malo and cvd have mortality as a real competing risk -> wolbers_cindex,
+    which correctly distinguishes "died before the outcome could occur" (permanently
+    precluded) from ordinary censoring (unknown fate) -- Uno's C treats them the same, which
+    biases the metric. IBS keeps using sksurv's integrated_brier_score for all three
+    outcomes (Wolbers doesn't have a Brier-score analogue in scope here).
 
     predictions: {"mortality": (n, T) CIF array, "malo": ..., "cvd": ...} at yearly bins
     1..T, T >= max(horizons) -- see module docstring for the exact convention.
@@ -181,9 +368,15 @@ def compute_all_metrics(predictions: dict, ground_truth: dict, horizons: list) -
     censoring time, using the SAME per-outcome censoring rule already implemented in
     compass.training.survival_losses / batching.py (mortality censors malo/cvd; malo/cvd
     don't censor each other), just consumed here for evaluation instead of training.
+    wolbers_cindex additionally needs to distinguish competing events from pure censoring
+    for malo/cvd; this is derived inline from ground_truth["mortality"]["event_indicator"]
+    (mortality occurring IS the competing event for malo/cvd) -- no change to the
+    ground_truth dict shape is needed.
 
     Returns a tidy DataFrame: columns [outcome, horizon, metric_name, value].
     """
+    mortality_event = ground_truth["mortality"]["event_indicator"].astype(bool)
+
     rows = []
     for outcome in OUTCOME_NAMES:
         cif_all = predictions[outcome]
@@ -194,7 +387,12 @@ def compute_all_metrics(predictions: dict, ground_truth: dict, horizons: list) -
             bin_idx = int(horizon) - 1
             cif_at_horizon = cif_all[:, bin_idx]
 
-            cindex = time_dependent_cindex(cif_at_horizon, event_indicator, time_years, horizon)
+            if outcome == "mortality":
+                cindex = time_dependent_cindex(cif_at_horizon, event_indicator, time_years, horizon)
+            else:
+                # 0=censored, 1=had this outcome, 2=competing event (mortality).
+                event_type = np.where(event_indicator.astype(bool), 1, np.where(mortality_event, 2, 0))
+                cindex = wolbers_cindex(cif_at_horizon, event_type, time_years, horizon, cause_of_interest=1)
 
             time_grid = np.arange(1, horizon + 1, dtype=float)
             cif_over_time = cif_all[:, : int(horizon)]
