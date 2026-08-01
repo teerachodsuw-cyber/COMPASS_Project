@@ -76,29 +76,38 @@ def time_dependent_cindex(
     return float(result[0])
 
 
-def _censoring_ipcw_weights(event_time: np.ndarray, event_type_indicator: np.ndarray, cause_of_interest: int) -> np.ndarray:
-    """Per-patient Uno (2011) IPCW weight 1/G(t_i-)^2, where G is the Kaplan-Meier survival
-    of the CENSORING distribution -- i.e. a patient is only ever "censored" here if
-    event_type_indicator == 0 (true loss to follow-up). A competing event does NOT count as
-    censoring for this fit: the patient's outcome was fully observed (just not the cause of
-    interest), so it must not depress G the way an administrative dropout does.
+def _censoring_km_curve(event_time: np.ndarray, event_type_indicator: np.ndarray, cause_of_interest: int) -> tuple:
+    """Fits G, the Kaplan-Meier survival of the CENSORING distribution -- i.e. a patient is
+    only ever "censored" here if event_type_indicator == 0 (true loss to follow-up). A
+    competing event does NOT count as censoring for this fit: the patient's outcome was fully
+    observed (just not the cause of interest), so it must not depress G the way an
+    administrative dropout does.
+
+    This is the shared, single source of truth behind both `_censoring_ipcw_weights` (Wolbers'
+    C-index) and `schoop_competing_risks_ibs` (competing-risks Brier score/IBS) -- the KM fit
+    itself (with its "events-first" tie handling, see below) is the part that's easy to get
+    subtly wrong, so it's fit exactly once here and only queried (via
+    `_censoring_survival_at`) by each metric, rather than reimplemented per metric.
 
     This distinction matters and was found the hard way: `comprisk`'s own
     compute_uno_weights folds competing events into its censoring-KM hazard (its own "events-
     first" convention is about tie-breaking between cause-of-interest events and censoring,
     not about excluding competing events), which inflates weights even when there is zero
     real censoring before a case's event time -- confirmed to diverge from R's pec::cindex
-    (see wolbers_cindex's docstring). This standalone helper uses the correct convention
-    instead (verified against pec::cindex to give G==1, i.e. weight==1, whenever there is no
-    real censoring before a case's time -- the condition under which pec::cindex matches
-    exactly, see tests/test_r_reference_fixtures.py).
+    (see wolbers_cindex's docstring). This helper uses the correct convention instead
+    (verified against pec::cindex to give G==1 whenever there is no real censoring before a
+    case's time -- the condition under which pec::cindex matches exactly, see
+    tests/test_r_reference_fixtures.py).
 
     "Events-first" tie handling: at an exact tie between a cause-of-interest event and a
     censoring event, the cause event is treated as leaving the risk set before the censoring
     hazard is computed at that instant (removed from the denominator) -- the standard
-    convention for this kind of tie, though this specific choice was NOT the source of this
-    function's small residual disagreement with R on tied-time data (both orderings were
-    tried and gave identical results, see the wolbers_cindex docstring).
+    convention for this kind of tie, though this specific choice was NOT the source of
+    wolbers_cindex's small residual disagreement with R on tied-time data (both orderings
+    were tried and gave identical results, see wolbers_cindex's docstring).
+
+    Returns (t_unique, g_at_knot): sorted unique observed times and G's value AT (i.e.
+    right-continuous, post-drop) each of those times.
     """
     event_time = np.asarray(event_time, dtype=float)
     is_cause = event_type_indicator == cause_of_interest
@@ -124,10 +133,41 @@ def _censoring_ipcw_weights(event_time: np.ndarray, event_type_indicator: np.nda
             surv = 0.0 if denom <= 0 else surv * (1.0 - d_censored / denom)
         g_at_knot[k] = surv
 
-    knot_idx = np.searchsorted(t_unique, event_time, side="left")
-    g_left = np.where(knot_idx > 0, g_at_knot[np.clip(knot_idx - 1, 0, None)], 1.0)
+    return t_unique, g_at_knot
+
+
+def _censoring_survival_at(t_unique: np.ndarray, g_at_knot: np.ndarray, query_times: np.ndarray, side: str) -> np.ndarray:
+    """G evaluated at `query_times`, from a curve already fit by `_censoring_km_curve`.
+
+    side="left": G(t-), the left limit (last knot strictly before t) -- used for patients
+    evaluated at their OWN observed time (Wolbers' C-index; the case/competing-event terms
+    of the Brier score), since they were known to still be at risk right up to that instant.
+    side="right": G(t), the right-continuous value AT t (last knot at or before t) -- used
+    for the Brier score's "still event-free" term at a fixed evaluation time t, the standard
+    Graf/Schoop convention (matches sksurv's own time_dependent Brier score formula, which
+    also uses G_hat(t) rather than G_hat(t-) for this term).
+    """
+    query_times = np.asarray(query_times, dtype=float)
+    if t_unique.size == 0:
+        return np.ones_like(query_times)
+    idx = np.searchsorted(t_unique, query_times, side=side)
+    return np.where(idx > 0, g_at_knot[np.clip(idx - 1, 0, None)], 1.0)
+
+
+def _censoring_ipcw_weights(
+    event_time: np.ndarray, event_type_indicator: np.ndarray, cause_of_interest: int, power: int = 2
+) -> np.ndarray:
+    """Per-patient IPCW weight 1/G(t_i-)^power, at each patient's OWN observed time (left
+    limit). power=2 (default) is the Uno (2011) C-index convention (wolbers_cindex);
+    power=1 is the Graf/Schoop Brier score convention (schoop_competing_risks_ibs). See
+    `_censoring_km_curve` for the underlying KM fit and its docstring for why it uses this
+    particular censoring-only convention rather than comprisk's.
+    """
+    event_time = np.asarray(event_time, dtype=float)
+    t_unique, g_at_knot = _censoring_km_curve(event_time, event_type_indicator, cause_of_interest)
+    g_left = _censoring_survival_at(t_unique, g_at_knot, event_time, side="left")
     g_left_safe = np.maximum(g_left, 1e-12)
-    return 1.0 / (g_left_safe**2)
+    return 1.0 / (g_left_safe**power)
 
 
 def wolbers_cindex(
@@ -256,6 +296,100 @@ def wolbers_cindex(
     return float(numerator / denominator)
 
 
+def schoop_competing_risks_ibs(
+    cif_over_time: np.ndarray,
+    event_type_indicator: np.ndarray,
+    event_time: np.ndarray,
+    horizon: float,
+    time_grid: np.ndarray,
+    cause_of_interest: int = 1,
+) -> float:
+    """Schoop, Beyersmann, Schumacher & Binder (2011, Biom J 53(1):88-112) competing-risks
+    IPCW Brier score / integrated Brier score for `cause_of_interest`, correctly handling a
+    real competing risk (e.g. mortality for malo/cvd) the same way wolbers_cindex does for
+    discrimination: a competing event means the patient's fate w.r.t. `cause_of_interest` is
+    known with certainty (permanently precluded, CIF should have been 0), not unknown the
+    way real censoring is. sksurv's integrated_brier_score (integrated_brier_score_metric)
+    treats a competing event as ordinary censoring, biasing the calibration estimate the same
+    way Uno's C biases discrimination.
+
+    event_type_indicator: integer code per patient -- 0 = censored, `cause_of_interest` = had
+    the outcome of interest, any OTHER positive code = had a competing event.
+
+    At each evaluation time t in `time_grid`, every patient falls into exactly one of three
+    cases (Graf/Schoop extension of the standard IPCW Brier score):
+    1. Had `cause_of_interest` at or before t: residual = (1 - CIF_hat(t))^2, weighted by
+       1/G(T_i-) -- known with certainty, weighted by the patient's own censoring risk up to
+       their (pre-t) event time.
+    2. Had a DIFFERENT (competing) event at or before t: residual = (0 - CIF_hat(t))^2, same
+       1/G(T_i-) weighting as case 1 -- also known with certainty (this outcome did NOT and
+       now cannot occur), not "unknown" the way sksurv's plain IBS treats it.
+    3. Still event-free (of ANY kind) as of t, whether ultimately censored or eventually
+       has some event after t: residual = (0 - CIF_hat(t))^2, weighted by 1/G(t) -- the
+       standard "still at risk, still uncertain" weighting, using the censoring survival AT
+       the fixed evaluation time t (not the patient's own time).
+    Patients purely CENSORED strictly before t fall into none of these three (their status
+    at t is genuinely unknown) and are excluded from BS(t) entirely, standard Brier score
+    convention -- BS(t) is normalized by the full n regardless (matching sksurv's own
+    formula), not by the count of retained patients.
+
+    IBS = trapezoidal integral of BS(t) over `time_grid`, normalized by
+    (time_grid[-1] - time_grid[0]), matching integrated_brier_score_metric's convention (via
+    sksurv) so the two are on the same, directly comparable scale.
+
+    G (the censoring-only KM survival) is fit once via `_censoring_km_curve` -- the SAME
+    shared, tested KM fit `_censoring_ipcw_weights` uses for wolbers_cindex, not a second,
+    potentially-divergent implementation.
+
+    VERIFIED against R's pec::pec(..., cause=cause_of_interest) (see
+    tests/test_r_reference_fixtures.py): see that file / this function's call sites for the
+    actual numbers.
+
+    Returns NaN if there are zero `cause_of_interest` events -- same reasoning as
+    time_dependent_cindex/wolbers_cindex/integrated_brier_score_metric: a real, foreseeable
+    draw under patient-level bootstrap resampling of a rare outcome, not an edge case that
+    "can't happen".
+    """
+    cif_over_time = np.asarray(cif_over_time, dtype=float)
+    event_type_indicator = np.asarray(event_type_indicator)
+    event_time = np.asarray(event_time, dtype=float)
+    time_grid = np.asarray(time_grid, dtype=float)
+
+    if (event_type_indicator == cause_of_interest).sum() == 0:
+        return float("nan")
+
+    n = event_time.size
+    is_cause = event_type_indicator == cause_of_interest
+    is_competing = (event_type_indicator != 0) & (event_type_indicator != cause_of_interest)
+    is_decided = is_cause | is_competing  # fate known with certainty, at the patient's own time
+
+    t_unique, g_at_knot = _censoring_km_curve(event_time, event_type_indicator, cause_of_interest)
+    weight_own_time = 1.0 / np.maximum(_censoring_survival_at(t_unique, g_at_knot, event_time, side="left"), 1e-12)
+    weight_at_grid = 1.0 / np.maximum(_censoring_survival_at(t_unique, g_at_knot, time_grid, side="right"), 1e-12)
+
+    brier_curve = np.empty(time_grid.size)
+    for col, t in enumerate(time_grid):
+        pred = cif_over_time[:, col]
+
+        decided_by_t = is_decided & (event_time <= t)
+        still_at_risk = event_time > t
+
+        residual = np.zeros(n)
+        residual[decided_by_t] = np.where(is_cause[decided_by_t], (1.0 - pred[decided_by_t]) ** 2, (0.0 - pred[decided_by_t]) ** 2)
+        residual[still_at_risk] = (0.0 - pred[still_at_risk]) ** 2
+
+        weight = np.zeros(n)
+        weight[decided_by_t] = weight_own_time[decided_by_t]
+        weight[still_at_risk] = weight_at_grid[col]
+
+        brier_curve[col] = float(np.sum(weight * residual) / n)
+
+    span = time_grid[-1] - time_grid[0]
+    if span <= 0:
+        return float(brier_curve[0])
+    return float(np.trapz(brier_curve, time_grid) / span)
+
+
 def integrated_brier_score_metric(
     cif_over_time: np.ndarray,
     event_indicator: np.ndarray,
@@ -351,15 +485,20 @@ def ipcw_calibration_curve(
 
 
 def compute_all_metrics(predictions: dict, ground_truth: dict, horizons: list) -> pd.DataFrame:
-    """Orchestrates C-index + integrated_brier_score_metric across all 3 outcomes x all
-    horizons for ONE model's predictions.
+    """Orchestrates C-index + IBS across all 3 outcomes x all horizons for ONE model's
+    predictions.
 
     C-index dispatch: mortality has no competing risk here -> time_dependent_cindex (Uno's
     C), unchanged. malo and cvd have mortality as a real competing risk -> wolbers_cindex,
     which correctly distinguishes "died before the outcome could occur" (permanently
     precluded) from ordinary censoring (unknown fate) -- Uno's C treats them the same, which
-    biases the metric. IBS keeps using sksurv's integrated_brier_score for all three
-    outcomes (Wolbers doesn't have a Brier-score analogue in scope here).
+    biases the metric.
+
+    IBS dispatch mirrors this exactly, same rationale: mortality -> integrated_brier_score_
+    metric (sksurv's IPCW Brier score), unchanged. malo/cvd -> schoop_competing_risks_ibs,
+    the Graf/Schoop competing-risks extension -- sksurv's plain IBS treats a competing event
+    (e.g. death before malo/cvd could occur) as ordinary censoring, which biases the
+    calibration estimate the same way Uno's C biases discrimination for those two outcomes.
 
     predictions: {"mortality": (n, T) CIF array, "malo": ..., "cvd": ...} at yearly bins
     1..T, T >= max(horizons) -- see module docstring for the exact convention.
@@ -368,10 +507,10 @@ def compute_all_metrics(predictions: dict, ground_truth: dict, horizons: list) -
     censoring time, using the SAME per-outcome censoring rule already implemented in
     compass.training.survival_losses / batching.py (mortality censors malo/cvd; malo/cvd
     don't censor each other), just consumed here for evaluation instead of training.
-    wolbers_cindex additionally needs to distinguish competing events from pure censoring
-    for malo/cvd; this is derived inline from ground_truth["mortality"]["event_indicator"]
-    (mortality occurring IS the competing event for malo/cvd) -- no change to the
-    ground_truth dict shape is needed.
+    wolbers_cindex and schoop_competing_risks_ibs additionally need to distinguish competing
+    events from pure censoring for malo/cvd; this is derived inline from
+    ground_truth["mortality"]["event_indicator"] (mortality occurring IS the competing event
+    for malo/cvd) -- no change to the ground_truth dict shape is needed.
 
     Returns a tidy DataFrame: columns [outcome, horizon, metric_name, value].
     """
@@ -383,20 +522,22 @@ def compute_all_metrics(predictions: dict, ground_truth: dict, horizons: list) -
         event_indicator = ground_truth[outcome]["event_indicator"]
         time_years = ground_truth[outcome]["time_years"]
 
+        # 0=censored, 1=had this outcome, 2=competing event (mortality) -- only meaningful
+        # (and only used) for malo/cvd; irrelevant for mortality's own unchanged dispatch.
+        event_type = np.where(event_indicator.astype(bool), 1, np.where(mortality_event, 2, 0))
+
         for horizon in horizons:
             bin_idx = int(horizon) - 1
             cif_at_horizon = cif_all[:, bin_idx]
+            time_grid = np.arange(1, horizon + 1, dtype=float)
+            cif_over_time = cif_all[:, : int(horizon)]
 
             if outcome == "mortality":
                 cindex = time_dependent_cindex(cif_at_horizon, event_indicator, time_years, horizon)
+                ibs = integrated_brier_score_metric(cif_over_time, event_indicator, time_years, horizon, time_grid)
             else:
-                # 0=censored, 1=had this outcome, 2=competing event (mortality).
-                event_type = np.where(event_indicator.astype(bool), 1, np.where(mortality_event, 2, 0))
                 cindex = wolbers_cindex(cif_at_horizon, event_type, time_years, horizon, cause_of_interest=1)
-
-            time_grid = np.arange(1, horizon + 1, dtype=float)
-            cif_over_time = cif_all[:, : int(horizon)]
-            ibs = integrated_brier_score_metric(cif_over_time, event_indicator, time_years, horizon, time_grid)
+                ibs = schoop_competing_risks_ibs(cif_over_time, event_type, time_years, horizon, time_grid, cause_of_interest=1)
 
             rows.append({"outcome": outcome, "horizon": horizon, "metric_name": "cindex", "value": cindex})
             rows.append({"outcome": outcome, "horizon": horizon, "metric_name": "ibs", "value": ibs})

@@ -19,6 +19,7 @@ from comprisk.metrics import compute_uno_weights, concordance_index_uno_cr
 from compass.evaluation.metrics import (
     integrated_brier_score_metric,
     ipcw_calibration_curve,
+    schoop_competing_risks_ibs,
     time_dependent_cindex,
     wolbers_cindex,
 )
@@ -184,3 +185,79 @@ def test_wolbers_cindex_vs_comprisk_uno_cr_same_ballpark():
         # additionally applies IPCW weighting that wolbers_cindex does not, so allow a
         # generous tolerance -- this just needs to catch gross errors, not drift.
         assert abs(ours - comprisk_val) < 0.05
+
+
+def test_schoop_ibs_well_calibrated_near_zero():
+    event_type = np.array([1, 1, 1, 1, 1, 2, 2, 0, 0])
+    time_years = np.array([1, 1, 1, 1, 1, 3, 3, 20, 20], dtype=float)
+    time_grid = np.arange(1, 11, dtype=float)
+
+    # Perfect knowledge: cause-1 patients' CIF is ~1 from their event time onward; everyone
+    # else (competing OR still at risk) stays ~0 throughout.
+    well_calibrated = np.zeros((9, 10))
+    well_calibrated[:5, :] = 0.999
+
+    ibs = schoop_competing_risks_ibs(well_calibrated, event_type, time_years, horizon=10, time_grid=time_grid, cause_of_interest=1)
+    assert ibs < 0.01
+
+
+def test_schoop_ibs_miscalibrated_worse():
+    event_type = np.array([1, 1, 1, 1, 1, 2, 2, 0, 0])
+    time_years = np.array([1, 1, 1, 1, 1, 3, 3, 20, 20], dtype=float)
+    time_grid = np.arange(1, 11, dtype=float)
+
+    well_calibrated = np.zeros((9, 10))
+    well_calibrated[:5, :] = 0.999
+    ibs_well = schoop_competing_risks_ibs(well_calibrated, event_type, time_years, horizon=10, time_grid=time_grid, cause_of_interest=1)
+
+    miscalibrated = np.full((9, 10), 0.99)
+    ibs_bad = schoop_competing_risks_ibs(miscalibrated, event_type, time_years, horizon=10, time_grid=time_grid, cause_of_interest=1)
+
+    assert ibs_bad > ibs_well
+    assert ibs_bad > 0.3
+
+
+def test_schoop_ibs_zero_cause_events_returns_nan():
+    event_type = np.array([2, 2, 0, 0])  # no cause-1 events at all
+    time_years = np.array([1.0, 2.0, 20.0, 20.0])
+    time_grid = np.arange(1, 11, dtype=float)
+    cif = np.full((4, 10), 0.3)
+
+    assert np.isnan(schoop_competing_risks_ibs(cif, event_type, time_years, horizon=10, time_grid=time_grid, cause_of_interest=1))
+
+
+def test_schoop_ibs_diverges_from_naive_ibs_with_uneven_competing_risk():
+    # A model that predicts a MODEST, roughly-flat CIF for everyone (e.g. 0.15). Group A
+    # (n=150) has almost no competing events -- naive IBS (treating competing events as
+    # censoring) and Schoop's should roughly agree there. Group B (n=150) has HEAVY early
+    # competing-event burden (death before cause-1 could occur) -- naive IBS scores this
+    # as "still at risk, uncertain," penalizing the flat 0.15 prediction as if those patients
+    # might still get cause-1 later; Schoop's knows their cause-1 fate is ALREADY decided
+    # (permanently 0) and scores the same flat prediction as a modest, known overprediction
+    # instead -- the same qualitative distinction as Gray's-vs-log-rank and Wolbers-vs-Uno.
+    rng = np.random.default_rng(7)
+    n_per_group = 150
+    horizon = 10.0
+    time_grid = np.arange(1, 11, dtype=float)
+
+    # Group A: mostly cause-1 or censored, few competing events.
+    a_type = rng.choice([1, 0], size=n_per_group, p=[0.3, 0.7])
+    a_time = np.where(a_type == 1, rng.uniform(1, 9, n_per_group), 20.0)
+
+    # Group B: heavy EARLY competing-event burden, few cause-1 events.
+    b_type = rng.choice([2, 1], size=n_per_group, p=[0.8, 0.2])
+    b_time = np.where(b_type == 2, rng.uniform(0.5, 2.0, n_per_group), rng.uniform(1, 9, n_per_group))
+
+    event_type = np.concatenate([a_type, b_type])
+    event_time = np.concatenate([a_time, b_time])
+    flat_cif = np.full((event_type.size, 10), 0.15)
+
+    schoop_ibs = schoop_competing_risks_ibs(flat_cif, event_type, event_time, horizon, time_grid, cause_of_interest=1)
+
+    # Naive: treats non-cause-1 events (competing OR censoring) identically as censoring,
+    # exactly the bias the Schoop correction exists to fix.
+    naive_event_indicator = (event_type == 1).astype(int)
+    naive_ibs = integrated_brier_score_metric(flat_cif, naive_event_indicator, event_time, horizon, time_grid)
+
+    assert not np.isnan(schoop_ibs) and not np.isnan(naive_ibs)
+    assert abs(schoop_ibs - naive_ibs) > 0.02  # must disagree substantially, not just be present but inert

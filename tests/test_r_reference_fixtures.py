@@ -38,6 +38,24 @@ in the auxiliary censoring-KM fit versus R's `prodlim`/`pec` on this deliberatel
 for a ~0.1%-of-scale residual). test_wolbers_cindex_matches_r_pec_reference_with_early_censoring
 below is a REAL (non-xfail) test at a wider, explicitly-justified tolerance that reflects this
 known, small, honestly-reported residual -- not a tightened-until-it-passes tolerance.
+
+Schoop et al. (2011) competing-risks Brier score / IBS (schoop_competing_risks_ibs) ALSO has
+an R-reference fixture here (tests/fixtures/schoop_ibs_r_reference.csv), generated via R's
+`pec::pec(..., cause=1)` -- same package, same Docker environment as the Wolbers fixture
+above (reinstalled fresh in a second Docker session since the first `--rm` container's
+install didn't persist; `pec::pec()`'s `cause` argument for competing-risks IBS was confirmed
+real via CRAN docs before spending the time). Predictions used are a deterministic synthetic
+CIF-over-time surface per patient (see scratchpad/gen_brier_predictions.py from that
+session), not the static rank scores used for the C-index fixtures, since a Brier score
+needs an actual predicted probability trajectory over time. `pec()` internally prepends an
+implicit t=0 (Brier=0 for everyone) boundary point to whatever `times` is requested -- easy
+to miss (it errored on the first attempt, an explicit dimension mismatch, not silent) -- and
+that point is excluded from the integrated value here to match this project's existing
+[time_grid[0], horizon] = [1, horizon] convention (integrated_brier_score_metric does not
+integrate from 0 either). Result: schoop_competing_risks_ibs matches pec::pec() EXACTLY (to
+R's printed precision) on case_a_malo and case_b_cvd, and within 0.000011 on case_c_ties --
+close enough to be floating-point/print-rounding noise (R's console output was rounded to 6
+decimals before being read back), not a real algorithmic residual like the Wolbers one above.
 """
 
 import numpy as np
@@ -46,7 +64,7 @@ import pytest
 
 from comprisk.gray_test import gray_test
 
-from compass.evaluation.metrics import wolbers_cindex
+from compass.evaluation.metrics import schoop_competing_risks_ibs, wolbers_cindex
 
 FIXTURES_DIR = "tests/fixtures"
 
@@ -59,6 +77,11 @@ def r_reference():
 @pytest.fixture(scope="module")
 def wolbers_r_reference():
     return pd.read_csv(f"{FIXTURES_DIR}/wolbers_cindex_r_reference.csv").set_index("case")
+
+
+@pytest.fixture(scope="module")
+def schoop_ibs_r_reference():
+    return pd.read_csv(f"{FIXTURES_DIR}/schoop_ibs_r_reference.csv").set_index("case")
 
 
 @pytest.mark.parametrize("case_name", ["case_a_malo", "case_b_cvd", "case_c_ties"])
@@ -108,3 +131,28 @@ def test_wolbers_cindex_matches_r_pec_reference_with_early_censoring(wolbers_r_r
     )
     r_row = wolbers_r_reference.loc["case_c_ties"]
     assert result == pytest.approx(r_row["wolbers_cindex"], abs=2e-3)
+
+
+@pytest.mark.parametrize("case_name, horizon", [("case_a_malo", 10), ("case_b_cvd", 10), ("case_c_ties", 5)])
+def test_schoop_ibs_matches_r_pec_reference(case_name, horizon, schoop_ibs_r_reference):
+    """Unlike wolbers_cindex, this matches pec::pec() closely on ALL three cases, including
+    case_c_ties (which has real censoring before its horizon and IS where wolbers_cindex has
+    its known small residual) -- 1e-3 tolerance here is still far tighter than that residual,
+    reflecting that this metric's match is effectively exact (see module docstring).
+    """
+    df = pd.read_csv(f"{FIXTURES_DIR}/{case_name}.csv")
+    pred_df = pd.read_csv(f"{FIXTURES_DIR}/{case_name}_cif_predictions.csv")
+    cif_cols = [c for c in pred_df.columns if c.startswith("cif_t")]
+    time_grid = np.array([float(c.replace("cif_t", "")) for c in cif_cols])
+    cif_matrix = pred_df[cif_cols].to_numpy()
+
+    result = schoop_competing_risks_ibs(
+        cif_over_time=cif_matrix,
+        event_type_indicator=df["event"].to_numpy(),
+        event_time=df["time"].to_numpy(),
+        horizon=horizon,
+        time_grid=time_grid,
+        cause_of_interest=1,
+    )
+    r_row = schoop_ibs_r_reference.loc[case_name]
+    assert result == pytest.approx(r_row["ibs"], abs=1e-3)
