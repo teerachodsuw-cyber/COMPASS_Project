@@ -4,7 +4,6 @@
 
 horizons:
   primary: 10  # years
-  secondary: [20, 30]
   discretization_method: "quantile_grid"  # TBD exact cutpoints, deferred to Stage 1
 
 splitting:
