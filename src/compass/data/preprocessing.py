@@ -78,6 +78,60 @@ def _encode_medication_and_demographic_features(
     return values, mask
 
 
+def scale_and_mask_examples(
+    examples: list[dict],
+    scalers: dict,
+    continuous_columns: list[str],
+    medication_columns: list[str],
+    sex_categories: tuple,
+    smoking_status_categories: list,
+    feature_names: list[str],
+) -> list[dict]:
+    """Apply ALREADY-FIT `scalers` (never refit here) plus masking/encoding to a list of raw
+    landmark examples (dicts with an "input_visits" key, from construct_landmark_example()),
+    producing the "input_values"/"input_mask" columns the rest of the pipeline (collate_
+    examples, model.forward) consumes.
+
+    Extracted from run_preprocessing (which calls this once per split, using scalers freshly
+    fit from the training split) into a standalone, public function so
+    compass.training.train.Trainer can reuse the EXACT same logic to build fresh landmark
+    examples each training epoch, using the SAME already-fit scalers -- not a second,
+    potentially-divergent scale/mask implementation. Scalers themselves are fit ONCE (from an
+    initial representative landmark sample, at Trainer setup) and never refit per epoch: only
+    WHICH landmark is sampled per patient changes epoch to epoch, not the scaling statistics
+    themselves -- refitting scalers from a shifting subset of training data every epoch would
+    introduce unwanted epoch-to-epoch drift in the input feature scale itself, on top of the
+    intended landmark variety.
+    """
+    if not examples:
+        return []
+    concat = pd.concat([ex["input_visits"] for ex in examples], ignore_index=True)
+    mask_source = concat[continuous_columns].notna().astype(int)
+    scaled = apply_scalers(concat, mask_source, scalers, continuous_columns)
+    cont_values_df, cont_mask_df = apply_masking(scaled, continuous_columns)
+
+    other_values_df, other_mask_df = _encode_medication_and_demographic_features(
+        concat, medication_columns, sex_categories, smoking_status_categories
+    )
+
+    full_values = pd.concat([cont_values_df[continuous_columns], other_values_df], axis=1)[feature_names]
+    full_mask = pd.concat([cont_mask_df[continuous_columns], other_mask_df], axis=1)[feature_names]
+
+    processed = []
+    pos = 0
+    for ex in examples:
+        n = len(ex["input_visits"])
+        processed.append(
+            {
+                **ex,
+                "input_values": full_values.iloc[pos : pos + n].reset_index(drop=True),
+                "input_mask": full_mask.iloc[pos : pos + n].reset_index(drop=True),
+            }
+        )
+        pos += n
+    return processed
+
+
 @dataclass
 class PreprocessedData:
     """Bundled, model-ready train/val/test data.
@@ -147,39 +201,10 @@ def run_preprocessing(
 
     feature_names = build_feature_names(continuous_columns, medication_columns, sex_categories, smoking_status_categories)
 
-    def _scale_and_mask(examples: list[dict]) -> list[dict]:
-        if not examples:
-            return []
-        concat = pd.concat([ex["input_visits"] for ex in examples], ignore_index=True)
-        mask_source = concat[continuous_columns].notna().astype(int)
-        scaled = apply_scalers(concat, mask_source, scalers, continuous_columns)
-        cont_values_df, cont_mask_df = apply_masking(scaled, continuous_columns)
-
-        other_values_df, other_mask_df = _encode_medication_and_demographic_features(
-            concat, medication_columns, sex_categories, smoking_status_categories
-        )
-
-        full_values = pd.concat([cont_values_df[continuous_columns], other_values_df], axis=1)[feature_names]
-        full_mask = pd.concat([cont_mask_df[continuous_columns], other_mask_df], axis=1)[feature_names]
-
-        processed = []
-        pos = 0
-        for ex in examples:
-            n = len(ex["input_visits"])
-            processed.append(
-                {
-                    **ex,
-                    "input_values": full_values.iloc[pos : pos + n].reset_index(drop=True),
-                    "input_mask": full_mask.iloc[pos : pos + n].reset_index(drop=True),
-                }
-            )
-            pos += n
-        return processed
-
     return PreprocessedData(
-        train=_scale_and_mask(train_examples),
-        val=_scale_and_mask(val_examples),
-        test=_scale_and_mask(test_examples),
+        train=scale_and_mask_examples(train_examples, scalers, continuous_columns, medication_columns, sex_categories, smoking_status_categories, feature_names),
+        val=scale_and_mask_examples(val_examples, scalers, continuous_columns, medication_columns, sex_categories, smoking_status_categories, feature_names),
+        test=scale_and_mask_examples(test_examples, scalers, continuous_columns, medication_columns, sex_categories, smoking_status_categories, feature_names),
         scalers=scalers,
         continuous_columns=list(continuous_columns),
         feature_names=feature_names,
