@@ -222,7 +222,7 @@ def real_pipeline_setup():
         continuous_columns,
         medication_columns,
         sex_categories=("male", "female"),
-        smoking_status_categories=[1, 2, 3, 4],
+        smoking_status_categories=[0, 1, 2],
         horizons=[10, 20, 30],
         train_frac=0.7,
         val_frac=0.15,

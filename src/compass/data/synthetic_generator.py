@@ -30,10 +30,8 @@ CONTINUOUS_VARIABLE_BOUNDS = {
     "hdl_cholesterol": (10.0, 150.0),
     "ldl_cholesterol": (10.0, 400.0),
     "plt": (5.0, 1000.0),
-    # NOTE: config mean/sd for crcl (1.33 / 1.46, unit mL/min) read more like serum
-    # creatinine (mg/dL) than creatinine clearance -- flagged as a possible schema
-    # mislabel, not corrected here. Bounds below just keep sampling non-degenerate.
-    "crcl": (0.05, 15.0),
+    # Serum creatinine in mg/dL (source column "crcl" is mislabelled CrCl in the source data).
+    "serum_creatinine": (0.05, 15.0),
     "egfr": (2.0, 200.0),
     "alt": (1.0, 2000.0),
     "ast": (1.0, 2000.0),
@@ -85,7 +83,9 @@ def generate_synthetic_cohort(
     sex = rng.choice(["male", "female"], size=n_patients, p=[0.4710, 0.5290])
     # NOTE: no confirmed category proportions exist yet for smoking_status in the
     # schema, so it is sampled uniformly here as a placeholder pending Stage 1.
-    smoking_status = rng.choice([1, 2, 3, 4], size=n_patients)
+    # Codes come from the schema: 0=never, 1=former, 2=current.
+    smoking_categories = next(d["values"] for d in schema["demographics"] if d["name"] == "smoking_status")
+    smoking_status = rng.choice(smoking_categories, size=n_patients)
 
     # Capped at range_days + 1 so sampling without replacement (below) never runs
     # out of distinct days to draw from -- irrelevant in practice at mean=8, but

@@ -16,7 +16,7 @@ continuous_variables:
   - {name: hdl_cholesterol, unit: mg/dL, mean: 51.39, sd: 16.03, missing_rate: 0.0039}
   - {name: ldl_cholesterol, unit: mg/dL, mean: 91.63, sd: 36.77, missing_rate: 0.0036}
   - {name: plt, unit: "10^3/uL", mean: 243.21, sd: 100.55, missing_rate: 0.0018}
-  - {name: crcl, unit: "mL/min", mean: 1.33, sd: 1.46, missing_rate: 0.0013}
+  - {name: serum_creatinine, unit: "mg/dL", description: "Serum creatinine (source column crcl; mislabelled CrCl in the source data)", mean: 1.33, sd: 1.46, missing_rate: 0.0013}
   - {name: egfr, unit: "mL/min/1.73m2", mean: 71.16, sd: 29.26, missing_rate: 0.0013}
   - {name: alt, unit: U/L, mean: 35.62, sd: 106.00, missing_rate: 0.0021}
   - {name: ast, unit: U/L, mean: 42.74, sd: 133.18, missing_rate: 0.0021}
@@ -39,21 +39,25 @@ medication_flags:  # all binary, confirmed prevalence noted as comments for synt
   - {name: ezetimibe, prevalence: 0.0454}
 
 demographics:
+  # Source data uses sex_code 1=male, 2=female; mapping to male/female is done in the loader.
   - {name: sex, type: categorical, values: [male, female]}  # confirmed proportions: male 0.4710, female 0.5290
-  - {name: smoking_status, type: categorical, values: [1, 2, 3, 4]}
+  - {name: smoking_status, type: categorical, values: [0, 1, 2]}  # 0=never, 1=former, 2=current
 
 outcomes:
-  - {name: mortality, type: time_to_event, role: primary}
-  - {name: malo, type: time_to_event, role: secondary, note: "composite: hepatic decompensation, cirrhosis, HCC, liver transplant, liver-related death"}
-  - {name: cvd, type: time_to_event, role: secondary, note: "composite: MI, stroke, CV death"}
+  - {name: mortality, type: time_to_event, role: primary, note: "All-cause, NHSO registry-linked."}
+  - {name: malo, type: time_to_event, role: secondary, note: "Composite, first incident event after index: compensated cirrhosis, decompensated cirrhosis, HCC, liver transplant. No liver-related death."}
+  - {name: cvd, type: time_to_event, role: secondary, note: "Composite, first incident event after index: CAD, stroke, HF, PVD. No CV death. Not at risk if any prevalent CVD at baseline (cad/stroke/hf/pvd_prev)."}
 
 censoring:
-  administrative_cutoff: "2025-06-30"
+  administrative_cutoff: "2025-06-30"  # locked 2026-11-10
   structure: semi_competing_risks
-  rule: "mortality censors both MALO and CVD if it occurs first; MALO and CVD do not censor each other"
+  # Semi-competing structure (unchanged): mortality censors MALO and CVD if it occurs first;
+  # MALO and CVD do not censor each other.
+  rule: "Mortality censored at the cutoff. MALO/CVD censored at last recorded contact (latest of last lab visit and own MALO/CVD dates), capped at the cutoff. Events after the cutoff are censored at the cutoff."
 
 cohort:
-  n_confirmed: 12667
+  n_delivered: 12602
+  n_analytic: 11665  # after exclusions: prior liver outcome 923, death on index 3, baseline liver cancer 11
   n_broader_t2dm_registry: 18000
   site: single_center
   institution: "Siriraj Hospital, Mahidol University"

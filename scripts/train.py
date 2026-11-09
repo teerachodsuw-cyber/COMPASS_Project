@@ -30,6 +30,7 @@ import pandas as pd
 import torch
 import yaml
 
+from compass.data.preprocessing import build_feature_names
 from compass.data.synthetic_generator import generate_synthetic_cohort
 from compass.models.dynamic_deephit.model import DynamicDeepHitModel
 from compass.models.survlatent_ode.model import SurvLatentODEModel
@@ -87,7 +88,9 @@ def train_one_model(name: str, args, visits_df, outcomes_df, schema, training_co
 
     continuous_columns = [v["name"] for v in schema["continuous_variables"]]
     medication_columns = [m["name"] for m in schema["medication_flags"]]
-    num_features = len(continuous_columns) + len(medication_columns) + 1 + 4  # +1 sex, +4 smoking one-hot
+    sex_categories = ("male", "female")
+    smoking_status_categories = next(d["values"] for d in schema["demographics"] if d["name"] == "smoking_status")
+    num_features = len(build_feature_names(continuous_columns, medication_columns, sex_categories, smoking_status_categories))
     administrative_cutoff = pd.Timestamp(schema["censoring"]["administrative_cutoff"])
     horizons = [int(training_config["horizons"]["primary"])]
 
@@ -102,8 +105,8 @@ def train_one_model(name: str, args, visits_df, outcomes_df, schema, training_co
         outcomes_df=outcomes_df,
         continuous_columns=continuous_columns,
         medication_columns=medication_columns,
-        sex_categories=("male", "female"),
-        smoking_status_categories=[1, 2, 3, 4],
+        sex_categories=sex_categories,
+        smoking_status_categories=smoking_status_categories,
         horizons=horizons,
         administrative_cutoff=administrative_cutoff,
     )

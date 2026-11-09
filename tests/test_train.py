@@ -14,6 +14,7 @@ import pytest
 import torch
 import yaml
 
+from compass.data.preprocessing import build_feature_names
 from compass.data.synthetic_generator import generate_synthetic_cohort
 from compass.models.dynamic_deephit.model import DynamicDeepHitModel
 from compass.models.survlatent_ode.model import SurvLatentODEModel
@@ -43,7 +44,7 @@ def synthetic_data():
 def data_columns(schema):
     continuous_columns = [v["name"] for v in schema["continuous_variables"]]
     medication_columns = [m["name"] for m in schema["medication_flags"]]
-    num_features = len(continuous_columns) + len(medication_columns) + 1 + 4
+    num_features = len(build_feature_names(continuous_columns, medication_columns, ("male", "female"), [0, 1, 2]))
     return continuous_columns, medication_columns, num_features
 
 
@@ -90,7 +91,7 @@ def _make_trainer(name, model_config_overrides, schema, training_config, synthet
         continuous_columns=continuous_columns,
         medication_columns=medication_columns,
         sex_categories=("male", "female"),
-        smoking_status_categories=[1, 2, 3, 4],
+        smoking_status_categories=[0, 1, 2],
         horizons=[10],
         administrative_cutoff=administrative_cutoff,
     )
