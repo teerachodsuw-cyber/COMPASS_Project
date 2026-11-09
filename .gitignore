@@ -46,3 +46,16 @@ data/processed/*
 # Experiment tracking
 wandb/
 mlruns/
+
+# Real-data and output safety net (never commit patient data or run artifacts)
+*.dta
+*.xlsx
+*.parquet
+*.log
+*.csv
+!tests/fixtures/*.csv
+!data/synthetic/*.csv
+checkpoints/
+logs/
+runs/
+outputs/
