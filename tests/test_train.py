@@ -115,8 +115,8 @@ def test_landmarks_resampled_each_epoch_in_training(schema, training_config, syn
     seen_landmarks = []
     real_sample_landmark = train_module.sample_landmark
 
-    def spy(patient_visits, rng_arg):
-        landmark = real_sample_landmark(patient_visits, rng_arg)
+    def spy(patient_visits, rng_arg, **kwargs):
+        landmark = real_sample_landmark(patient_visits, rng_arg, **kwargs)
         seen_landmarks.append(landmark)
         return landmark
 

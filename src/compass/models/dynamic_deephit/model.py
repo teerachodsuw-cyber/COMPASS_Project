@@ -134,13 +134,14 @@ class DynamicDeepHitModel(CompassSurvivalModel):
             event_indicator = batch[f"{name}_event_indicator"]
             event_bin = batch[f"{name}_event_bin"]
             censoring_bin = batch[f"{name}_censoring_bin"]
+            at_risk = batch[f"{name}_at_risk"]
 
-            nll_terms[name] = discrete_time_survival_nll(hazards[name], event_indicator, event_bin, censoring_bin)
+            nll_terms[name] = discrete_time_survival_nll(hazards[name], event_indicator, event_bin, censoring_bin, at_risk)
 
             observed_bin = torch.where(event_indicator.bool(), event_bin, censoring_bin)
             # Rank by CIF at the reporting horizon's bin (10 yr -> bin 9), not "the last bin".
             risk_score = self.hazards_to_cif(hazards[name], [self.horizon_bin])[:, 0]
-            rank_terms[name] = ranking_loss(risk_score, event_indicator, observed_bin)
+            rank_terms[name] = ranking_loss(risk_score, event_indicator, observed_bin, at_risk=at_risk)
 
         survival_nll = sum(self.outcome_weights[name] * nll_terms[name] for name in OUTCOME_NAMES)
         total_ranking = sum(rank_terms.values())

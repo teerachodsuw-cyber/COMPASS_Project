@@ -15,6 +15,7 @@ from compass.models.base import OUTCOME_NAMES, years_to_bin_index
 from compass.models.dynamic_deephit.losses import ranking_loss
 from compass.models.dynamic_deephit.model import DynamicDeepHitModel
 from compass.training.batching import collate_examples
+from compass.training.targets import compute_last_visit_dates
 
 
 def _make_example(patient_id: str, landmark_date: pd.Timestamp, num_features: int = 3) -> dict:
@@ -33,6 +34,12 @@ def _make_example(patient_id: str, landmark_date: pd.Timestamp, num_features: in
 
 LANDMARK = pd.Timestamp("2015-01-01")
 ADMIN_CUTOFF = LANDMARK + pd.DateOffset(years=30)
+
+
+def _last_visits(outcomes_df: pd.DataFrame) -> pd.Series:
+    """Hand-built cases: last visit on the admin cutoff, so MALO/CVD follow-up runs to the
+    cutoff and a death before it is a competing event (what these cases were written for)."""
+    return pd.Series(ADMIN_CUTOFF, index=outcomes_df["patient_id"])
 
 
 def test_output_shape():
@@ -62,10 +69,11 @@ def test_malo_cvd_can_coexist():
                 "malo_date": LANDMARK + pd.DateOffset(years=3),
                 "cvd_event": 1,
                 "cvd_date": LANDMARK + pd.DateOffset(years=8),
+                "cvd_at_risk": 1,
             }
         ]
     )
-    batch = collate_examples([example], outcomes_df, ADMIN_CUTOFF, bin_width_years=1.0, num_time_bins=30)
+    batch = collate_examples([example], outcomes_df, ADMIN_CUTOFF, bin_width_years=1.0, num_time_bins=30, last_visit_dates=_last_visits(outcomes_df))
 
     # The classic joint-softmax DeepHit head would have no valid way to represent this
     # patient (malo and cvd "competing" for the same probability mass) -- proves the
@@ -91,10 +99,11 @@ def test_mortality_censors_malo_and_cvd():
                 "malo_date": pd.NaT,
                 "cvd_event": 0,
                 "cvd_date": pd.NaT,
+                "cvd_at_risk": 1,
             }
         ]
     )
-    batch = collate_examples([example], outcomes_df, ADMIN_CUTOFF, bin_width_years=1.0, num_time_bins=30)
+    batch = collate_examples([example], outcomes_df, ADMIN_CUTOFF, bin_width_years=1.0, num_time_bins=30, last_visit_dates=_last_visits(outcomes_df))
 
     death_years = (death_date - LANDMARK).days / 365.25
     admin_years = (ADMIN_CUTOFF - LANDMARK).days / 365.25
@@ -118,6 +127,7 @@ def test_malo_does_not_censor_cvd():
                 "malo_date": LANDMARK + pd.DateOffset(years=3),
                 "cvd_event": 1,
                 "cvd_date": LANDMARK + pd.DateOffset(years=8),
+                "cvd_at_risk": 1,
             }
         ]
     )
@@ -133,12 +143,13 @@ def test_malo_does_not_censor_cvd():
                 "malo_date": pd.NaT,
                 "cvd_event": 1,
                 "cvd_date": LANDMARK + pd.DateOffset(years=8),  # same cvd as A
+                "cvd_at_risk": 1,
             }
         ]
     )
 
-    batch_a = collate_examples([example_a], outcomes_a, ADMIN_CUTOFF, 1.0, 30)
-    batch_b = collate_examples([example_b], outcomes_b, ADMIN_CUTOFF, 1.0, 30)
+    batch_a = collate_examples([example_a], outcomes_a, ADMIN_CUTOFF, 1.0, 30, last_visit_dates=_last_visits(outcomes_a))
+    batch_b = collate_examples([example_b], outcomes_b, ADMIN_CUTOFF, 1.0, 30, last_visit_dates=_last_visits(outcomes_b))
 
     assert batch_a["cvd_event_indicator"].item() == batch_b["cvd_event_indicator"].item()
     assert batch_a["cvd_event_bin"].item() == batch_b["cvd_event_bin"].item()
@@ -189,7 +200,7 @@ def real_pipeline_batch():
         seed=42,
     )
     admin_cutoff = pd.Timestamp(schema["cohort"]["date_range"][1])
-    batch = collate_examples(result.train[:16], outcomes_df, admin_cutoff, bin_width_years=1.0, num_time_bins=30)
+    batch = collate_examples(result.train[:16], outcomes_df, admin_cutoff, bin_width_years=1.0, num_time_bins=30, last_visit_dates=compute_last_visit_dates(visits_df))
     return batch, len(result.feature_names)
 
 

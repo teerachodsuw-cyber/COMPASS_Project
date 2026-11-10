@@ -53,7 +53,7 @@ censoring:
   structure: semi_competing_risks
   # Semi-competing structure (unchanged): mortality censors MALO and CVD if it occurs first;
   # MALO and CVD do not censor each other.
-  rule: "Mortality censored at the cutoff. MALO/CVD censored at last recorded contact (latest of last lab visit and own MALO/CVD dates), capped at the cutoff. Events after the cutoff are censored at the cutoff."
+  rule: "Mortality: censored at the cutoff (2025-06-30). MALO/CVD, each on its own: if its event occurs (after the landmark, on/before the cutoff), follow-up ends at the event; otherwise censored at min(last lab visit, cutoff). A death after the last lab visit is not a competing event. Events after the cutoff are censored at the cutoff."
 
 cohort:
   n_delivered: 12602

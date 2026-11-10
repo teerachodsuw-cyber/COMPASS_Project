@@ -56,9 +56,10 @@ import numpy as np
 import pandas as pd
 import torch
 
-from compass.data.landmarking import construct_landmark_example, sample_landmark
+from compass.data.landmarking import construct_landmark_example, death_date_of, sample_landmark
 from compass.data.preprocessing import run_preprocessing, scale_and_mask_examples
 from compass.training.batching import collate_examples
+from compass.training.targets import compute_last_visit_dates
 
 # Fixed, epoch-independent seed offset for the ONE-TIME val/test landmark sample built at
 # Trainer setup -- matches compass.data.preprocessing.run_preprocessing's own convention
@@ -150,6 +151,9 @@ class Trainer:
             pid: group.sort_values("visit_date").reset_index(drop=True) for pid, group in visits_df.groupby("patient_id")
         }
         self._outcomes_indexed = outcomes_df.set_index("patient_id")
+        # Last visit per patient from the FULL visit table -- computed once, before any
+        # landmark truncation (MALO/CVD censoring uses it; see compass.training.targets).
+        self.last_visit_dates = compute_last_visit_dates(visits_df)
 
         self._resume_epoch = None
         self._resume_rng_state = None
@@ -169,8 +173,8 @@ class Trainer:
         raw_examples = []
         for pid in patient_ids:
             patient_visits = self._visits_by_patient[pid]
-            landmark_date = sample_landmark(patient_visits, rng)
             patient_outcomes = self._outcomes_indexed.loc[pid]
+            landmark_date = sample_landmark(patient_visits, rng, death_date=death_date_of(patient_outcomes))
             raw_examples.append(construct_landmark_example(patient_visits, patient_outcomes, landmark_date, self.horizons))
         return scale_and_mask_examples(
             raw_examples, self.scalers, self.continuous_columns, self.medication_columns,
@@ -185,7 +189,10 @@ class Trainer:
         return [ids[i : i + self.batch_size] for i in range(0, len(ids), self.batch_size)]
 
     def _run_batch(self, examples: list[dict], train: bool) -> dict[str, float]:
-        batch = collate_examples(examples, self.outcomes_df, self.administrative_cutoff, self.bin_width_years, self.num_time_bins)
+        batch = collate_examples(
+            examples, self.outcomes_df, self.administrative_cutoff, self.bin_width_years, self.num_time_bins,
+            last_visit_dates=self.last_visit_dates,
+        )
         if train:
             self.optimizer.zero_grad()
             loss_dict = self.model.compute_loss(batch)

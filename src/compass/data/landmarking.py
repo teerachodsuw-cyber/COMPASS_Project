@@ -11,12 +11,27 @@ import pandas as pd
 OUTCOME_NAMES = ("mortality", "malo", "cvd")
 
 
-def sample_landmark(patient_visits: pd.DataFrame, rng: np.random.Generator) -> pd.Timestamp:
+def death_date_of(patient_outcomes: pd.Series) -> pd.Timestamp:
+    """The patient's death date if mortality_event == 1, else NaT."""
+    if patient_outcomes["mortality_event"] == 1 and pd.notna(patient_outcomes["mortality_date"]):
+        return pd.Timestamp(patient_outcomes["mortality_date"])
+    return pd.NaT
+
+
+def sample_landmark(
+    patient_visits: pd.DataFrame, rng: np.random.Generator, *, death_date: pd.Timestamp
+) -> pd.Timestamp:
     """Sample one random landmark time from a single patient's own visit dates.
 
-    If the patient has only one visit, that visit IS the landmark.
+    Candidate landmarks on or after death_date are dropped (pass NaT/None for a patient
+    who did not die). If only one candidate remains, it IS the landmark. Raises if no visit
+    precedes death -- the loader/validator guarantee death is strictly after index.
     """
     visit_dates = patient_visits["visit_date"].to_numpy()
+    if death_date is not None and pd.notna(death_date):
+        visit_dates = visit_dates[visit_dates < np.datetime64(pd.Timestamp(death_date))]
+    if len(visit_dates) == 0:
+        raise ValueError("sample_landmark: no visit before death_date -- no valid landmark for this patient")
     idx = rng.integers(0, len(visit_dates))
     return pd.Timestamp(visit_dates[idx])
 

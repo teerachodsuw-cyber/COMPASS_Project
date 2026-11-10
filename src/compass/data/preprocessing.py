@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from compass.data.landmarking import construct_landmark_example, sample_landmark
+from compass.data.landmarking import construct_landmark_example, death_date_of, sample_landmark
 from compass.data.masking import apply_masking
 from compass.data.scaling import apply_scalers, fit_scalers
 from compass.data.splitting import patient_level_split
@@ -185,8 +185,8 @@ def run_preprocessing(
         examples = []
         for pid in patient_ids:
             patient_visits = visits_by_patient[pid]
-            landmark_date = sample_landmark(patient_visits, rng)
             patient_outcomes = outcomes_indexed.loc[pid]
+            landmark_date = sample_landmark(patient_visits, rng, death_date=death_date_of(patient_outcomes))
             examples.append(construct_landmark_example(patient_visits, patient_outcomes, landmark_date, horizons))
         return examples
 

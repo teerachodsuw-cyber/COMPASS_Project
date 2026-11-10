@@ -23,6 +23,7 @@ def ranking_loss(
     event_indicator: torch.Tensor,
     observed_bin: torch.Tensor,
     sigma: float = 0.1,
+    at_risk: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pairwise concordance-style ranking loss for ONE outcome (call once per outcome,
     sum the three results in the caller).
@@ -34,7 +35,8 @@ def ranking_loss(
     earlier to be scored as higher risk than patients who were still event-free (or
     censored) at that time.
 
-    risk_scores/event_indicator/observed_bin: (batch,).
+    risk_scores/event_indicator/observed_bin: (batch,). at_risk: (batch,) 0/1 -- only pairs
+    where BOTH patients are at risk for this outcome are compared (averaged over those pairs).
     """
     batch_size = risk_scores.shape[0]
     if batch_size < 2:
@@ -45,6 +47,9 @@ def ranking_loss(
     event_i = event_indicator.unsqueeze(1).expand(batch_size, batch_size)
 
     comparable = (event_i == 1) & (time_i < time_j)
+    if at_risk is not None:
+        risk = at_risk.bool()
+        comparable = comparable & risk.unsqueeze(1) & risk.unsqueeze(0)
 
     if comparable.sum() == 0:
         return torch.zeros((), device=risk_scores.device)

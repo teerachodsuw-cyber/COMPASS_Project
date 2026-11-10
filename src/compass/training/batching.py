@@ -1,28 +1,19 @@
-"""Batch collation for variable-length patient sequences, plus derivation of per-outcome
-discrete-time hazard targets (event_indicator, event_bin, censoring_bin) from raw
-landmark/outcome data -- applying this project's locked semi-competing-risks censoring
-rule (configs/data_schema.yaml: censoring.rule): mortality censors both malo and cvd if it
-occurs first; malo and cvd do not censor each other.
+"""Batch collation for variable-length patient sequences. Outcome targets come from
+compass.training.targets.build_targets -- the only place outcome times are computed (event /
+competing / censoring rules, at-risk flags, 13-bin window cap: see that module).
 
 Also computes `elapsed_days` (batch, seq_len): days since the previous visit (0 for each
 patient's first visit), from each example's raw `input_visits["visit_date"]`. This is
 generic, model-agnostic timing info -- computed here once so any architecture that needs
 real elapsed time (currently TRACER, SurvLatentODE; Dynamic-DeepHit ignores it) doesn't have
 to re-derive it from raw dates itself.
-
-Also exposes each outcome's continuous-time target as `{name}_target_days` (days from
-landmark to that outcome's event time if it occurred, else its censoring time under the
-same per-outcome censoring rule) -- SurvLatentODE's continuous-time loss needs this instead
-of a discrete bin index. It is not new computation: `event_time_for_bin`/`censor_years`
-below are already derived for the discrete-bin targets; this just also exposes that same
-value in days rather than only converting it to a bin index.
 """
 
 import numpy as np
 import pandas as pd
 import torch
 
-from compass.models.base import OUTCOME_NAMES, years_to_bin_index
+from compass.training.targets import build_targets
 
 
 def collate_examples(
@@ -31,22 +22,16 @@ def collate_examples(
     administrative_cutoff: pd.Timestamp,
     bin_width_years: float,
     num_time_bins: int,
+    *,
+    last_visit_dates: pd.Series,
 ) -> dict[str, torch.Tensor]:
-    """Pad a list of PreprocessedData landmark examples into batch tensors, and compute
-    each outcome's (event_indicator, event_bin, censoring_bin) hazard-loss targets.
+    """Pad a list of landmark examples into batch tensors and attach each outcome's targets
+    from build_targets(): {name}_event_indicator, _competing_indicator, _event_bin,
+    _censoring_bin, _target_days, _at_risk.
 
-    Per-outcome censoring rule:
-    - mortality: censored at the administrative cutoff only.
-    - malo / cvd: censored at min(administrative cutoff, mortality event time) if mortality
-      occurred -- death stops further risk-set exposure for the non-fatal outcomes,
-      regardless of the OTHER non-fatal outcome's own status (they don't censor each other).
-
-    Modelled window: the bins cover (0, num_time_bins * bin_width_years] years from landmark
-    (13 yearly bins by default, covering all observable follow-up; the 10-yr evaluation
-    horizon lies inside this window). An event or censoring time beyond the
-    end of the last bin is treated as CENSORED at the end of the last bin (survived all
-    bins) -- never clipped into the last bin as an event. The continuous-time target
-    (`{name}_target_days`) is capped the same way.
+    last_visit_dates: patient_id -> last visit_date in the FULL visit table
+    (compass.training.targets.compute_last_visit_dates), computed once by the caller before
+    landmark truncation -- never derived from the truncated input_visits here.
     """
     batch_size = len(examples)
     seq_lengths = torch.tensor([len(ex["input_values"]) for ex in examples], dtype=torch.long)
@@ -66,66 +51,21 @@ def collate_examples(
             gaps_days = np.diff(visit_dates).astype("timedelta64[D]").astype(np.float32)
             elapsed_days[i, 1:n] = torch.tensor(gaps_days)
 
-    outcomes_indexed = outcomes_df.set_index("patient_id")
-    landmark_dates = [ex["landmark_date"] for ex in examples]
-
-    admin_years = np.array([(administrative_cutoff - ld).days / 365.25 for ld in landmark_dates], dtype=np.float32)
-    admin_years = np.clip(admin_years, a_min=1e-3, a_max=None)  # guard against landmark == cutoff
-    max_followup_years = np.float32(num_time_bins * bin_width_years)  # end of the last bin
-
-    outcome_rows = outcomes_indexed.loc[[ex["patient_id"] for ex in examples]]
-    mortality_flag = outcome_rows["mortality_event"].to_numpy().astype(int)
-    mortality_date = pd.to_datetime(outcome_rows["mortality_date"]).to_numpy()
-    mortality_years = np.array(
-        [
-            (pd.Timestamp(d) - ld).days / 365.25 if flag else np.inf
-            for d, flag, ld in zip(mortality_date, mortality_flag, landmark_dates)
-        ],
-        dtype=np.float32,
-    )
-
     batch: dict[str, torch.Tensor] = {
         "values": values,
         "mask": mask,
         "seq_lengths": seq_lengths,
         "elapsed_days": elapsed_days,
     }
-
-    for name in OUTCOME_NAMES:
-        event_flag = outcome_rows[f"{name}_event"].to_numpy().astype(int)
-        event_date = pd.to_datetime(outcome_rows[f"{name}_date"]).to_numpy()
-        event_years = np.array(
-            [
-                (pd.Timestamp(d) - ld).days / 365.25 if flag else np.nan
-                for d, flag, ld in zip(event_date, event_flag, landmark_dates)
-            ],
-            dtype=np.float32,
+    batch.update(
+        build_targets(
+            [ex["patient_id"] for ex in examples],
+            [ex["landmark_date"] for ex in examples],
+            outcomes_df,
+            last_visit_dates,
+            administrative_cutoff,
+            bin_width_years,
+            num_time_bins,
         )
-        # An event flagged but dated at/before landmark or beyond the admin cutoff isn't a
-        # valid in-follow-up event for THIS landmark example -- treat as censored rather
-        # than feeding a negative/out-of-range time into the loss (defensive: this data
-        # should already respect landmark<event per landmarking.py/validate_schema.py, but
-        # this is new derived computation those checks don't directly cover).
-        event_in_followup = (event_flag == 1) & (event_years > 0) & (event_years <= admin_years)
-
-        if name == "mortality":
-            censor_years = admin_years
-        else:
-            mortality_censor = np.where(mortality_flag == 1, mortality_years, np.inf)
-            censor_years = np.minimum(admin_years, mortality_censor)
-        censor_years = np.clip(censor_years, a_min=1e-3, a_max=None)
-
-        # Beyond the modelled window: an event after the last bin is not an event within the
-        # window -- it is censored at the end of the last bin (survived all bins), as is any
-        # censoring time beyond it. Never clip a late event into the last bin as an event.
-        event_in_followup = event_in_followup & (event_years <= max_followup_years)
-        censor_years = np.minimum(censor_years, max_followup_years)
-
-        event_time_for_bin = np.where(event_in_followup, event_years, censor_years)
-
-        batch[f"{name}_event_indicator"] = torch.tensor(event_in_followup.astype(np.float32))
-        batch[f"{name}_event_bin"] = years_to_bin_index(torch.tensor(event_time_for_bin), bin_width_years, num_time_bins)
-        batch[f"{name}_censoring_bin"] = years_to_bin_index(torch.tensor(censor_years), bin_width_years, num_time_bins)
-        batch[f"{name}_target_days"] = torch.tensor(event_time_for_bin * 365.25, dtype=torch.float32)
-
+    )
     return batch

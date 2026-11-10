@@ -1,8 +1,8 @@
 """TRACER loss: sum of three independent per-outcome discrete-time hazard NLLs, inverse-
 frequency weighted. Unlike Dynamic-DeepHit, TRACER has NO ranking loss and NO auxiliary
 next-visit prediction loss -- just direct discrete-time hazard negative log-likelihood per
-outcome, using the same per-outcome censoring rule (mortality censors malo/cvd; malo and
-cvd do not censor each other).
+outcome, using the same per-outcome targets (compass.training.targets.build_targets), each
+averaged over that outcome's at-risk examples only.
 """
 
 import torch
@@ -17,8 +17,8 @@ def tracer_survival_loss(
     outcome_weights: dict[str, float],
 ) -> dict[str, torch.Tensor]:
     """hazards: {"mortality": ..., "malo": ..., "cvd": ...}, each (batch, num_time_bins).
-    batch must contain {name}_event_indicator / {name}_event_bin / {name}_censoring_bin per
-    outcome, from compass.training.batching.collate_examples (the same targets Dynamic-
+    batch must contain {name}_event_indicator / {name}_event_bin / {name}_censoring_bin /
+    {name}_at_risk per outcome, from compass.training.batching.collate_examples (the same targets Dynamic-
     DeepHit uses, so the two architectures are compared on identical censoring semantics).
 
     Returns {"survival_nll": total, "total": total} -- total loss IS the survival NLL, sum
@@ -31,6 +31,7 @@ def tracer_survival_loss(
             batch[f"{name}_event_indicator"],
             batch[f"{name}_event_bin"],
             batch[f"{name}_censoring_bin"],
+            batch[f"{name}_at_risk"],
         )
         for name in OUTCOME_NAMES
     }

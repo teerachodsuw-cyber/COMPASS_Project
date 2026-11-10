@@ -47,6 +47,12 @@ def _years(y: float) -> pd.Timestamp:
     return LANDMARK + pd.Timedelta(days=int(y * YEAR_DAYS))
 
 
+def _last_visits(ids) -> pd.Series:
+    # Last visit on the 15-yr cutoff: MALO/CVD follow-up runs to the cutoff, so these cases
+    # isolate the window cap (last-visit censoring is covered in tests/test_targets.py).
+    return pd.Series(ADMIN_CUTOFF, index=list(ids))
+
+
 def _window_days(num_bins: int) -> float:
     return num_bins * BIN_WIDTH * YEAR_DAYS
 
@@ -72,9 +78,12 @@ def batch(num_bins):
             "malo_date": [_years(12), _years(9.5), LANDMARK + pd.DateOffset(years=10), _years(14), pd.NaT, pd.NaT],
             "cvd_event": [0] * 6,
             "cvd_date": [pd.NaT] * 6,
+            "cvd_at_risk": [1] * 6,
         }
     )
-    return collate_examples([_example(p) for p in IDS], outcomes, ADMIN_CUTOFF, BIN_WIDTH, num_bins)
+    return collate_examples(
+        [_example(p) for p in IDS], outcomes, ADMIN_CUTOFF, BIN_WIDTH, num_bins, last_visit_dates=_last_visits(IDS)
+    )
 
 
 # ---- batching -------------------------------------------------------------------------
@@ -98,10 +107,10 @@ def test_event_at_12yr_with_13_bins_stays_event_in_bin_11():
             "patient_id": ["late"],
             "mortality_event": [0], "mortality_date": [pd.NaT],
             "malo_event": [1], "malo_date": [_years(12)],
-            "cvd_event": [0], "cvd_date": [pd.NaT],
+            "cvd_event": [0], "cvd_date": [pd.NaT], "cvd_at_risk": [1],
         }
     )
-    b = collate_examples([_example("late")], outcomes, ADMIN_CUTOFF, BIN_WIDTH, 13)
+    b = collate_examples([_example("late")], outcomes, ADMIN_CUTOFF, BIN_WIDTH, 13, last_visit_dates=_last_visits(["late"]))
     assert b["malo_event_indicator"].tolist() == [1.0]
     assert b["malo_event_bin"].tolist() == [11]
     assert b["malo_target_days"].tolist()[0] == pytest.approx(12 * YEAR_DAYS)

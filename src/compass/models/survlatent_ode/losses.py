@@ -1,8 +1,9 @@
 """SurvLatent ODE continuous-time survival loss: per-outcome negative log-likelihood using
-the model's own ODE solver to compute the survival integral (cumulative hazard), applying
-the SAME per-outcome censoring rule as Dynamic-DeepHit/TraCeR (mortality censors malo/cvd;
-malo and cvd do not censor each other) -- here expressed as WHICH continuous time each
-outcome's likelihood integrates up to, rather than a discrete censoring bin.
+the model's own ODE solver to compute the survival integral (cumulative hazard), using the
+SAME per-outcome targets as Dynamic-DeepHit/TraCeR (compass.training.targets.build_targets;
+a competing death is censoring at the death date) -- here expressed as WHICH continuous time
+each outcome's likelihood integrates up to, rather than a discrete censoring bin. Each
+outcome is averaged over its at-risk examples only.
 
 - event occurred at continuous time t: likelihood = hazard_rate(t) * survival(t), where
   survival(t) = exp(-integral of hazard from 0 to t).
@@ -18,6 +19,7 @@ same simplicity as TraCeR.
 import torch
 
 from compass.models.base import OUTCOME_NAMES
+from compass.training.survival_losses import at_risk_mean
 
 
 def _outcome_nll(
@@ -26,6 +28,7 @@ def _outcome_nll(
     event_indicator: torch.Tensor,
     target_days: torch.Tensor,
     outcome_name: str,
+    at_risk: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """target_days: (batch,) days from landmark to this outcome's event time (if it
     occurred) or its censoring time (under the project's per-outcome censoring rule) --
@@ -37,6 +40,9 @@ def _outcome_nll(
     10-yr evaluation horizon): an event after the cap is treated as censored at the cap, and
     a censoring time after the cap is censored at the cap. collate_examples already applies
     this cap; it is repeated here defensively.
+
+    at_risk: (batch,) 0/1 -- averaged over at-risk examples only (at_risk == 0 contributes
+    nothing).
     """
     max_days = float(model.num_time_bins * model.bin_width_years * 365.25)
     event_beyond_window = target_days > max_days + 1e-3  # tolerance for float32 days<->years round-trip
@@ -51,7 +57,7 @@ def _outcome_nll(
     log_lik_censored = -cum_hazard_outcome
 
     log_lik = event_indicator * log_lik_event + (1.0 - event_indicator) * log_lik_censored
-    return -log_lik.mean()
+    return at_risk_mean(-log_lik, at_risk)
 
 
 def survlatent_ode_survival_loss(
@@ -60,7 +66,8 @@ def survlatent_ode_survival_loss(
     batch: dict[str, torch.Tensor],
     outcome_weights: dict[str, float],
 ) -> dict[str, torch.Tensor]:
-    """batch must contain, per outcome, {name}_event_indicator and {name}_target_days (see
+    """batch must contain, per outcome, {name}_event_indicator, {name}_target_days and
+    {name}_at_risk (see
     compass.training.batching.collate_examples).
 
     Returns {"survival_nll": total, "total": total} -- total IS the survival NLL, sum of
@@ -74,6 +81,7 @@ def survlatent_ode_survival_loss(
             batch[f"{name}_event_indicator"],
             batch[f"{name}_target_days"],
             name,
+            batch[f"{name}_at_risk"],
         )
         for name in OUTCOME_NAMES
     }
