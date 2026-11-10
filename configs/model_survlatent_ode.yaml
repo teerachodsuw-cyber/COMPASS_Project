@@ -19,7 +19,7 @@ solver_method: dopri5    # placeholder; 'rk4' (fixed-step) is a faster alternati
 # Discrete-time comparison interface only (see hazards_at_bins() in model.py) -- the model
 # itself is continuous internally. Same yearly-bin scheme as Dynamic-DeepHit/TraCeR for
 # comparability. Exact cutpoints deferred to Stage 1.
-num_time_bins: 30       # placeholder
+num_time_bins: 13       # Bins cover all observable follow-up; the evaluation horizon stays 10 yr.
 bin_width_years: 1.0    # placeholder
 
 # No ranking_weight / auxiliary_weight -- like TraCeR, SurvLatent ODE's loss is just the sum

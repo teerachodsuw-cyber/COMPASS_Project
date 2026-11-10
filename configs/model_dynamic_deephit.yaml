@@ -10,7 +10,9 @@ batch_size: 128        # placeholder
 
 # Discrete-time hazard binning. PLACEHOLDER: simple yearly bins, not the locked
 # "quantile_grid" method (configs/training.yaml) -- exact cutpoints deferred to Stage 1.
-num_time_bins: 30      # placeholder, covers up to 30yr follow-up (longest reporting horizon)
+num_time_bins: 13      # Bins cover all observable follow-up; the evaluation horizon stays 10 yr.
+                       # Yearly bins (0,1] ... (12,13]; max follow-up 2013-06-01 -> 2025-06-30 ~ 12.1 yr.
+                       # Anything after the last bin is censored at 13 yr (see training/batching.py).
 bin_width_years: 1.0   # placeholder
 
 # Loss weights: total = survival_nll + ranking_weight * ranking_loss +

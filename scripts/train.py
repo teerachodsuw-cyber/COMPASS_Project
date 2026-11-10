@@ -44,7 +44,7 @@ MODEL_REGISTRY = {
 }
 
 
-def _build_model(name: str, model_config: dict, num_features: int):
+def _build_model(name: str, model_config: dict, num_features: int, horizon_years: float):
     model_cls, _ = MODEL_REGISTRY[name]
     if name == "dynamic_deephit":
         return model_cls(
@@ -56,6 +56,7 @@ def _build_model(name: str, model_config: dict, num_features: int):
             bin_width_years=model_config["bin_width_years"],
             ranking_weight=model_config["ranking_weight"],
             auxiliary_weight=model_config["auxiliary_weight"],
+            horizon_years=horizon_years,
         )
     if name == "tracer":
         return model_cls(
@@ -95,7 +96,7 @@ def train_one_model(name: str, args, visits_df, outcomes_df, schema, training_co
     horizons = [int(training_config["horizons"]["primary"])]
 
     torch.manual_seed(training_config["seed"])
-    model = _build_model(name, model_config, num_features)
+    model = _build_model(name, model_config, num_features, horizon_years=horizons[0])
 
     trainer = Trainer(
         model=model,

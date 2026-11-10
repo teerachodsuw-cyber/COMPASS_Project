@@ -14,7 +14,7 @@ batch_size: 128              # placeholder
 
 # Discrete-time hazard binning -- same placeholder yearly scheme as Dynamic-DeepHit, for
 # comparability between the two. Exact cutpoints deferred to Stage 1.
-num_time_bins: 30       # placeholder
+num_time_bins: 13       # Bins cover all observable follow-up; the evaluation horizon stays 10 yr.
 bin_width_years: 1.0    # placeholder
 
 # Time-decay missingness gate (TRACER's native mechanism, replaces mask+zero-fill):

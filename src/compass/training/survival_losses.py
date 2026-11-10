@@ -32,10 +32,19 @@ def discrete_time_survival_nll(
     non-fatal outcome's status. This function itself is outcome-agnostic and
     architecture-agnostic.
 
+    Beyond the last bin: an event_bin past the last bin (>= num_time_bins) is NOT clipped
+    into the last bin as an event -- it is treated as censored at the end of the last bin
+    (survived all bins). A censoring_bin past the last bin is likewise censored at the last
+    bin. compass.training.batching already produces targets in range; this is defensive.
+
     hazard: (batch, num_time_bins). event_indicator/event_bin/censoring_bin: (batch,).
     """
     eps = 1e-8
     num_time_bins = hazard.shape[1]
+
+    event_beyond_window = event_bin > num_time_bins - 1
+    event_indicator = event_indicator.float() * (~event_beyond_window).float()
+    censoring_bin = torch.where(event_beyond_window, torch.full_like(censoring_bin, num_time_bins - 1), censoring_bin)
 
     log_survival = torch.log(torch.clamp(1.0 - hazard, min=eps))
     cumulative_log_survival = torch.cumsum(log_survival, dim=1)  # log P(survive through bin t)
@@ -52,7 +61,6 @@ def discrete_time_survival_nll(
     censoring_bin_clamped = censoring_bin.clamp(0, num_time_bins - 1)
     log_lik_censored = cumulative_log_survival.gather(1, censoring_bin_clamped.unsqueeze(1)).squeeze(1)
 
-    event_indicator = event_indicator.float()
     log_lik = event_indicator * log_lik_event + (1.0 - event_indicator) * log_lik_censored
 
     return -log_lik.mean()

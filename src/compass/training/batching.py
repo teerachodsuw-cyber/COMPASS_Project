@@ -40,6 +40,13 @@ def collate_examples(
     - malo / cvd: censored at min(administrative cutoff, mortality event time) if mortality
       occurred -- death stops further risk-set exposure for the non-fatal outcomes,
       regardless of the OTHER non-fatal outcome's own status (they don't censor each other).
+
+    Modelled window: the bins cover (0, num_time_bins * bin_width_years] years from landmark
+    (13 yearly bins by default, covering all observable follow-up; the 10-yr evaluation
+    horizon lies inside this window). An event or censoring time beyond the
+    end of the last bin is treated as CENSORED at the end of the last bin (survived all
+    bins) -- never clipped into the last bin as an event. The continuous-time target
+    (`{name}_target_days`) is capped the same way.
     """
     batch_size = len(examples)
     seq_lengths = torch.tensor([len(ex["input_values"]) for ex in examples], dtype=torch.long)
@@ -64,6 +71,7 @@ def collate_examples(
 
     admin_years = np.array([(administrative_cutoff - ld).days / 365.25 for ld in landmark_dates], dtype=np.float32)
     admin_years = np.clip(admin_years, a_min=1e-3, a_max=None)  # guard against landmark == cutoff
+    max_followup_years = np.float32(num_time_bins * bin_width_years)  # end of the last bin
 
     outcome_rows = outcomes_indexed.loc[[ex["patient_id"] for ex in examples]]
     mortality_flag = outcome_rows["mortality_event"].to_numpy().astype(int)
@@ -106,6 +114,12 @@ def collate_examples(
             mortality_censor = np.where(mortality_flag == 1, mortality_years, np.inf)
             censor_years = np.minimum(admin_years, mortality_censor)
         censor_years = np.clip(censor_years, a_min=1e-3, a_max=None)
+
+        # Beyond the modelled window: an event after the last bin is not an event within the
+        # window -- it is censored at the end of the last bin (survived all bins), as is any
+        # censoring time beyond it. Never clip a late event into the last bin as an event.
+        event_in_followup = event_in_followup & (event_years <= max_followup_years)
+        censor_years = np.minimum(censor_years, max_followup_years)
 
         event_time_for_bin = np.where(event_in_followup, event_years, censor_years)
 

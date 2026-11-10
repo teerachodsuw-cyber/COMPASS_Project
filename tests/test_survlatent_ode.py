@@ -223,7 +223,7 @@ def real_pipeline_setup():
         medication_columns,
         sex_categories=("male", "female"),
         smoking_status_categories=[0, 1, 2],
-        horizons=[10, 20, 30],
+        horizons=[10],
         train_frac=0.7,
         val_frac=0.15,
         test_frac=0.15,

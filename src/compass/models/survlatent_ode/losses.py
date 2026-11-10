@@ -31,7 +31,18 @@ def _outcome_nll(
     occurred) or its censoring time (under the project's per-outcome censoring rule) --
     same value construct_landmark_example/collate_examples already derive for the discrete-
     time models, exposed here in continuous (days) form rather than a discrete bin index.
+
+    The integration target is capped at the end of the last bin (num_time_bins *
+    bin_width_years, 13 yr with the default 13 yearly bins -- the binned window, not the
+    10-yr evaluation horizon): an event after the cap is treated as censored at the cap, and
+    a censoring time after the cap is censored at the cap. collate_examples already applies
+    this cap; it is repeated here defensively.
     """
+    max_days = float(model.num_time_bins * model.bin_width_years * 365.25)
+    event_beyond_window = target_days > max_days + 1e-3  # tolerance for float32 days<->years round-trip
+    event_indicator = event_indicator.float() * (~event_beyond_window).float()
+    target_days = torch.clamp(target_days, max=max_days)
+
     evolved_h, cum_hazard = model._integrate_hazard_to(landmark_state, target_days)
     cum_hazard_outcome = cum_hazard[outcome_name]
     hazard_rate_at_t = model._hazard_rate(outcome_name, evolved_h)
@@ -39,7 +50,6 @@ def _outcome_nll(
     log_lik_event = torch.log(torch.clamp(hazard_rate_at_t, min=1e-8)) - cum_hazard_outcome
     log_lik_censored = -cum_hazard_outcome
 
-    event_indicator = event_indicator.float()
     log_lik = event_indicator * log_lik_event + (1.0 - event_indicator) * log_lik_censored
     return -log_lik.mean()
 

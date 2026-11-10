@@ -2,8 +2,9 @@
 discrete-time hazard heads (sigmoid, not a shared softmax across causes -- see
 compass.models.base for why).
 
-Uses simple yearly discrete-time bins by default (bin_width_years=1.0, num_time_bins=30 ->
-follow-up up to 30 years, matching the project's longest reporting horizon). This is a
+Uses simple yearly discrete-time bins by default (bin_width_years=1.0, num_time_bins=13 ->
+bins (0,1] ... (12,13] years, covering all observable follow-up; the evaluation horizon
+stays 10 yr, and the ranking loss reads the 10-yr horizon bin, not the last bin). This is a
 PLACEHOLDER discretization; exact cutpoints are deferred to Stage 1 per the project's locked
 "quantile_grid" methodology (see compass.models.base.quantile_time_grid).
 """
@@ -26,22 +27,34 @@ class DynamicDeepHitModel(CompassSurvivalModel):
         hidden_dim: int = 64,
         num_gru_layers: int = 2,
         cause_head_hidden_dim: int = 32,
-        num_time_bins: int = 30,
+        num_time_bins: int = 13,
         bin_width_years: float = 1.0,
         ranking_weight: float = 0.1,
         auxiliary_weight: float = 0.1,
         outcome_weights: dict[str, float] | None = None,
+        horizon_years: float = 10.0,
     ):
         """outcome_weights: optional per-outcome multiplier on the survival log-likelihood
         term (inverse-frequency weighting, per configs/training.yaml's locked
         class_imbalance_handling method). Callers should compute these from the TRAINING
         split's actual outcome rates -- this class stays agnostic to how they're derived.
         Defaults to equal weight (1.0) per outcome.
+
+        horizon_years: the reporting horizon (configs/training.yaml: horizons.primary). The
+        ranking loss scores patients by their CIF at this horizon's bin. Must lie within the
+        binned window (num_time_bins * bin_width_years).
         """
         super().__init__()
         self.num_features = num_features
         self.num_time_bins = num_time_bins
         self.bin_width_years = bin_width_years
+        if not 0 < horizon_years <= num_time_bins * bin_width_years:
+            raise ValueError(
+                f"horizon_years={horizon_years} is outside the binned window "
+                f"(0, {num_time_bins * bin_width_years}] years"
+            )
+        self.horizon_years = horizon_years
+        self.horizon_bin = self.years_to_bin_index(horizon_years)
         self.ranking_weight = ranking_weight
         self.auxiliary_weight = auxiliary_weight
         self.outcome_weights = outcome_weights or {name: 1.0 for name in OUTCOME_NAMES}
@@ -125,7 +138,8 @@ class DynamicDeepHitModel(CompassSurvivalModel):
             nll_terms[name] = discrete_time_survival_nll(hazards[name], event_indicator, event_bin, censoring_bin)
 
             observed_bin = torch.where(event_indicator.bool(), event_bin, censoring_bin)
-            risk_score = self.hazards_to_cif(hazards[name], [self.num_time_bins - 1])[:, 0]
+            # Rank by CIF at the reporting horizon's bin (10 yr -> bin 9), not "the last bin".
+            risk_score = self.hazards_to_cif(hazards[name], [self.horizon_bin])[:, 0]
             rank_terms[name] = ranking_loss(risk_score, event_indicator, observed_bin)
 
         survival_nll = sum(self.outcome_weights[name] * nll_terms[name] for name in OUTCOME_NAMES)

@@ -47,7 +47,7 @@ class SurvLatentODEModel(CompassSurvivalModel):
         latent_dim: int = 16,
         ode_hidden_dim: int = 32,
         cause_head_hidden_dim: int = 16,
-        num_time_bins: int = 30,
+        num_time_bins: int = 13,
         bin_width_years: float = 1.0,
         solver_method: str = "dopri5",
         outcome_weights: dict[str, float] | None = None,
@@ -101,10 +101,10 @@ class SurvLatentODEModel(CompassSurvivalModel):
         )
         # Hazard rate is per-YEAR internally (see _YEAR_DAYS conversion below -- elapsed_days
         # /target_days stay in days at the public interface, matching the rest of the
-        # project's convention, e.g. TraCeR). Softplus(0) ~ 0.69/yr integrated over a ~30yr
-        # window would still give a cumulative hazard around 20 at random init; initializing
+        # project's convention, e.g. TraCeR). Softplus(0) ~ 0.69/yr integrated over the 13yr
+        # window would still give a cumulative hazard around 9 at random init; initializing
         # each decoder's output bias negative starts the rate near a realistic per-year scale
-        # (e.g. bias=-5 -> rate ~0.007/yr -> ~0.1 cumulative hazard over 15yr) instead.
+        # (e.g. bias=-5 -> rate ~0.007/yr -> ~0.09 cumulative hazard over the 13yr window) instead.
         for decoder in self.cause_decoders.values():
             nn.init.constant_(decoder[-1].bias, -5.0)
 
@@ -119,7 +119,7 @@ class SurvLatentODEModel(CompassSurvivalModel):
         """Evolve latent state h by real_days (batch,), one shared odeint call for the
         whole batch even though each element's real elapsed time differs (tau-in-[0,1]
         reparametrization, see module docstring). Internally scales by YEARS, not raw days
-        -- with a bounded (tanh) derivative, scaling by raw days (up to ~11000 for a 30yr
+        -- with a bounded (tanh) derivative, scaling by raw days (up to ~4750 for the 13yr
         censoring window) still let per-segment drift reach the hundreds for realistic
         multi-hundred-day visit gaps; years shrinks that ~365x to a numerically tractable
         range without changing the public days-based interface.
@@ -161,7 +161,7 @@ class SurvLatentODEModel(CompassSurvivalModel):
         self, h: torch.Tensor, target_days: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Evolve h to each patient's own target_days (batch,) -- which can range from a
-        few days to ~30 years within one batch (event/censoring times vary enormously per
+        few days to 13 years (capped at the end of the last bin) within one batch (event/censoring times vary enormously per
         patient) -- and return the cumulative hazard integrated over [0, target_days].
 
         A single _evolve_with_hazard_integral() call scales the vector field by real_days
@@ -172,7 +172,7 @@ class SurvLatentODEModel(CompassSurvivalModel):
         O(1-10) range). Fixed by walking forward in UNIFORM sub-steps (bounded to
         bin_width_years, the same granularity hazards_at_bins() already uses successfully)
         instead of one giant heterogeneous-scale jump -- each step's real_days range is
-        [0, bin_width_days], not [0, ~11000], which is numerically well-behaved. Patients
+        [0, bin_width_days], not [0, ~4750], which is numerically well-behaved. Patients
         who reach their own target_days early get step_days=0 (a true no-op: dh/dtau =
         0 * f(h) = 0) for remaining steps, so this naturally handles per-patient stopping.
         """

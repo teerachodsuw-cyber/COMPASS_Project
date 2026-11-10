@@ -8,7 +8,7 @@ dependency), locked as part of the methodology as a supplementary diagnostic sep
 the discrimination-calibration scatter.
 
 Units: all times (event_or_censoring_time, horizon, time_grid) are in YEARS from landmark,
-matching the project's horizons convention (configs/training.yaml: 10/20/30yr) -- distinct
+matching the project's single 10-year horizon (configs/training.yaml: horizons.primary) -- distinct
 from compass.training.batching's internal days-based convention; ground truth is converted
 at the boundary when built from a collate_examples-style batch (see compute_all_metrics).
 

@@ -44,7 +44,7 @@ class TracerModel(CompassSurvivalModel):
         num_transformer_layers: int = 2,
         cause_head_hidden_dim: int = 32,
         dropout: float = 0.1,
-        num_time_bins: int = 30,
+        num_time_bins: int = 13,
         bin_width_years: float = 1.0,
         max_staleness_days: float = 3650.0,
         outcome_weights: dict[str, float] | None = None,
