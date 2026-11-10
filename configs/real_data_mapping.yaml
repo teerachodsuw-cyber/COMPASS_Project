@@ -1,0 +1,110 @@
+# Real-data column mapping: Siriraj MASLD-T2DM analysis file -> COMPASS pipeline names
+# (configs/data_schema.yaml). Loader step 1: mapping only -- no loader code reads this yet.
+# Column names and settings only; no data values.
+#
+# Per entry: column (real .dta column), level (visit = [TV] per-visit column; baseline =
+# one value per patient, repeated on every row), confidence (high / check), note.
+# "check" = label unclear, units/scale differ from the schema mean, no per-visit column
+# exists, or more than one column could fit (candidates listed).
+#
+# placement: baseline_once (baseline-only variables) --
+#   Entered once on the first visit on/after index_date; blank (masked) at later visits.
+#   Never repeated.
+
+source:
+  file: data/raw/MASLD_analysis_v1_20261105.dta
+  read_with: {convert_dates: true, convert_categoricals: false}
+  layout: "long: one row per lab visit (date_visit_lab); patient-level columns repeat on every row"
+
+structure:
+  patient_id: person_id
+  visit_date: date_visit_lab        # [TV] Visit date
+  index_date: index_date            # per patient
+
+cohort:
+  landmarks: on_or_after_index_date
+  rule: "Landmarks only at visits on/after index_date. Earlier visits are history only (model input, never a landmark)."
+
+continuous_variables:
+  index_age:        {column: age_rc,              level: baseline, confidence: high,  note: "Baseline age at index (years); static by design"}
+  height:           {column: height_clean_rc,     level: baseline, placement: baseline_once, confidence: check, note: "No per-visit height column; baseline only. Real median differs from the schema mean (see review)"}
+  weight:           {column: weight_clean_rc,     level: baseline, placement: baseline_once, confidence: check, note: "No per-visit weight column; baseline only"}
+  bmi:              {column: bmi_clean_rc,        level: baseline, placement: baseline_once, confidence: check, note: "No per-visit BMI column; baseline only. Candidates: bmi_clean_rc (cleaned, recorded), bmi_cal_bl_rc (calculated from weight/height)"}
+  dbp:              {column: dbp_clean_rc,        level: baseline, placement: baseline_once, confidence: check, note: "No per-visit DBP column; baseline only"}
+  sbp:              {column: sbp_clean_rc,        level: baseline, placement: baseline_once, confidence: check, note: "No per-visit SBP column; baseline only"}
+  fbs:              {column: FBS_lab_rc,          level: visit,    confidence: high}
+  hba1c:            {column: HbA1c_lab_rc,        level: visit,    confidence: high}
+  cholesterol:      {column: chole_lab_rc,        level: visit,    confidence: high}
+  triglyceride:     {column: triglyceride_lab_rc, level: visit,    confidence: high}
+  hdl_cholesterol:  {column: hdl_lab_rc,          level: visit,    confidence: high}
+  ldl_cholesterol:  {column: ldl_lab_rc,          level: visit,    confidence: high}
+  plt:              {column: Plt_lab_rc,          level: visit,    confidence: high}
+  serum_creatinine: {column: cr_lab_rc,           level: visit,    confidence: check, note: "Instruction was serum_creatinine <- crcl, but no crcl column exists in this file. cr_lab_rc is labelled '[TV] Serum creatinine at visit (mg/dL)'"}
+  egfr:             {column: egfr_lab_rc,         level: visit,    confidence: high}
+  alt:              {column: alt_lab_rc,          level: visit,    confidence: high}
+  ast:              {column: ast_lab_rc,          level: visit,    confidence: high}
+  e_median:         {column: emedian_rc,          level: baseline, placement: baseline_once, confidence: check, note: "FibroScan LSM; baseline only, no per-visit column"}
+  cap_median:       {column: capmedian_rc,        level: baseline, placement: baseline_once, confidence: check, note: "FibroScan CAP; baseline only, no per-visit column"}
+
+medication_flags:   # all coded 0/1
+  metformin:     {column: metformin_lab, level: visit,    confidence: high}
+  sulfonylureas: {column: sus_lab,       level: visit,    confidence: high}
+  pioglitazone:  {column: tzd_lab,       level: visit,    confidence: high,  note: "Labelled 'Thiazolidinedione (pioglitazone)'"}
+  insulin:       {column: insulin_lab,   level: visit,    confidence: high}
+  dpp4:          {column: dpp4_lab,      level: visit,    confidence: high}
+  glp1:          {column: glp1_lab,      level: visit,    confidence: high}
+  sglt2:         {column: sglt2_lab,     level: visit,    confidence: high}
+  acei:          {column: acei_lab,      level: visit,    confidence: high}
+  arb:           {column: arb_lab,       level: visit,    confidence: high}
+  arni:          {column: arni_clean,    level: baseline, placement: baseline_once, confidence: check, note: "No per-visit ARNI column; baseline only"}
+  statins:       {column: statin_lab,    level: visit,    confidence: check, note: "'Any statin at visit'. Candidates: statin_lab (any), statinhydro_lab (hydrophilic), statinlipo_lab (lipophilic)"}
+  fibrate:       {column: fibrate_lab,   level: visit,    confidence: high}
+  ezetimibe:     {column: ezetimibe_lab, level: visit,    confidence: high}
+
+demographics:
+  sex:
+    column: sex_code
+    level: baseline
+    confidence: high
+    code_map: {1: male, 2: female}      # Stata value labels: 1=Male, 2=Female
+    note: "female (1=Yes) is an equivalent recoding; not used"
+  smoking_status:
+    column: smoking_clean
+    level: baseline
+    confidence: high
+    code_map: {0: 0, 1: 1, 2: 2}        # Stata value labels: 0=Never, 1=Former, 2=Current = schema codes
+    note: "NaN = missing (allowed by the validator)"
+
+outcomes:
+  date_columns_note: >-
+    Source <x>_dt columns (death_dt and every component's _dt) hold the event date OR a
+    censoring date. Clear the date (set NaT) wherever the matching event flag is 0; keep it
+    only where the event flag is 1.
+  mortality:
+    event: death_ev                     # "All-cause death (1=Yes), censored 30 Jun 2025"
+    date: death_dt                      # "Death or censoring date"
+    choice: >-
+      death_ev is the only column labelled as an all-cause death indicator, and its censoring
+      date (30 Jun 2025) matches the schema cutoff. Rejected: fu_end ("death or 30 Jun 2025",
+      no flag to tell the two apart); <x>_status == 2 ("death without event", outcome-specific,
+      misses deaths after that outcome's event); death_fu_y (derived follow-up time).
+  malo:
+    components:
+      com_cirrhosis:   {event: com_cirrhosis_ev,   date: com_cirrhosis_dt,   prevalent: com_cirrhosis_prev}
+      decom_cirrhosis: {event: decom_cirrhosis_ev, date: decom_cirrhosis_dt, prevalent: decom_cirrhosis_prev}
+      hcc:             {event: hcc_ev,             date: hcc_dt,             prevalent: hcc_prev}
+      livertx:         {event: livertx,            date: livertx_dt,         prevalent: null}   # no _prev column for transplant
+  cvd:
+    components:
+      cad:    {event: cad_ev,    date: cad_dt,    prevalent: cad_prev}
+      stroke: {event: stroke_ev, date: stroke_dt, prevalent: stroke_prev}
+      hf:     {event: hf_ev,     date: hf_dt,     prevalent: hf_prev}
+      pvd:    {event: pvd_ev,    date: pvd_dt,    prevalent: pvd_prev}
+    at_risk: "cvd_at_risk = 1 iff cad_prev, stroke_prev, hf_prev and pvd_prev are all 0"
+
+exclusion_inputs:
+  liver_cancer_baseline: Liver_Cancer   # baseline flag (comorbidity block; can be missing where not merged)
+  visit_after_death: visit_after_death  # [TV] 1 = visit dated after death ("do not use")
+
+# Never map: excluded features.
+excluded_features: [fib4_bl_rc, fib4_tv_rc, alcohol_clean, family_clean]
