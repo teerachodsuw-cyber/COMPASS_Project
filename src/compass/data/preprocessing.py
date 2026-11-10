@@ -186,7 +186,9 @@ def run_preprocessing(
         for pid in patient_ids:
             patient_visits = visits_by_patient[pid]
             patient_outcomes = outcomes_indexed.loc[pid]
-            landmark_date = sample_landmark(patient_visits, rng, death_date=death_date_of(patient_outcomes))
+            landmark_date = sample_landmark(
+                patient_visits, rng, index_date=patient_outcomes["index_date"], death_date=death_date_of(patient_outcomes)
+            )
             examples.append(construct_landmark_example(patient_visits, patient_outcomes, landmark_date, horizons))
         return examples
 

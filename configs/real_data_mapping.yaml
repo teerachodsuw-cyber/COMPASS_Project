@@ -106,5 +106,18 @@ exclusion_inputs:
   liver_cancer_baseline: Liver_Cancer   # baseline flag (comorbidity block; can be missing where not merged)
   visit_after_death: visit_after_death  # [TV] 1 = visit dated after death ("do not use")
 
+# Patient exclusions, applied in this order by compass.data.loader.build_cohort. A prior
+# component = its prevalent flag == 1, or its event flag == 1 dated on/before index_date.
+# expected_removed / expected_analytic_n: build_cohort(check_expected=True) raises if the
+# observed count differs (never adjusted to fit).
+exclusions:
+  - {id: E1, label: "Prior liver outcome (cirrhosis, decompensated cirrhosis, HCC) on/before index_date", rule: prior_component, outcome: malo, components: [com_cirrhosis, decom_cirrhosis, hcc], expected_removed: 923}
+  - {id: E2, label: "Liver transplant on/before index_date", rule: prior_component, outcome: malo, components: [livertx]}
+  - {id: E3, label: "Death on index_date", rule: death_on_or_before_index, expected_removed: 3}
+  - {id: E4, label: "Baseline Liver_Cancer == 1", rule: flag_equals_one, input: liver_cancer_baseline, expected_removed: 11}
+expected_analytic_n: 11665
+# After visit cleaning, patients with no valid landmark (no visit on/after index_date and
+# before death) are dropped and logged as E5.
+
 # Never map: excluded features.
 excluded_features: [fib4_bl_rc, fib4_tv_rc, alcohol_clean, family_clean]

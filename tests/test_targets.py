@@ -271,15 +271,15 @@ def test_landmark_on_death_date_never_sampled():
         {"patient_id": ["P"] * 4, "visit_date": pd.to_datetime(["2015-01-01", "2017-01-01", "2019-01-01", "2019-02-01"])}
     )
     rng = np.random.default_rng(0)
-    landmarks = {sample_landmark(visits, rng, death_date=death) for _ in range(200)}
+    landmarks = {sample_landmark(visits, rng, index_date=pd.Timestamp("2015-01-01"), death_date=death) for _ in range(200)}
     assert landmarks == {pd.Timestamp("2015-01-01"), pd.Timestamp("2017-01-01")}
     assert all(lm < death for lm in landmarks)
     # alive patient: every visit is a candidate
-    alive = {sample_landmark(visits, rng, death_date=pd.NaT) for _ in range(200)}
+    alive = {sample_landmark(visits, rng, index_date=pd.Timestamp("2015-01-01"), death_date=pd.NaT) for _ in range(200)}
     assert len(alive) == 4
 
 
 def test_no_visit_before_death_raises():
     visits = pd.DataFrame({"patient_id": ["P"], "visit_date": pd.to_datetime(["2019-01-01"])})
-    with pytest.raises(ValueError, match="no visit before death_date"):
-        sample_landmark(visits, np.random.default_rng(0), death_date=pd.Timestamp("2019-01-01"))
+    with pytest.raises(ValueError, match="no valid landmark"):
+        sample_landmark(visits, np.random.default_rng(0), index_date=pd.Timestamp("2018-01-01"), death_date=pd.Timestamp("2019-01-01"))

@@ -61,4 +61,6 @@ cohort:
   n_broader_t2dm_registry: 18000
   site: single_center
   institution: "Siriraj Hospital, Mahidol University"
+  # date_range applies to VISIT dates only. Event dates must be after index_date and
+  # on/before the cutoff (censoring.administrative_cutoff); index_date itself can precede it.
   date_range: ["2013-06-01", "2025-06-30"]

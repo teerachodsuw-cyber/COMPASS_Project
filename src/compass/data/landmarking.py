@@ -18,20 +18,40 @@ def death_date_of(patient_outcomes: pd.Series) -> pd.Timestamp:
     return pd.NaT
 
 
+def _as_datetime64(x):
+    """Scalar (Timestamp / NaT / None) or array-like of dates -> numpy datetime64[ns]."""
+    if x is None or (np.ndim(x) == 0 and pd.isna(x)):
+        return np.datetime64("NaT", "ns")
+    if np.ndim(x) == 0:
+        return np.datetime64(pd.Timestamp(x), "ns")
+    return pd.to_datetime(pd.Series(x)).to_numpy()
+
+
+def landmark_candidate_mask(visit_dates, index_date, death_date) -> np.ndarray:
+    """Which visits may serve as landmarks: visit_date >= index_date AND < death_date.
+    Visits before index_date are history only. NaT/None death_date = did not die.
+    index_date / death_date may be scalars (one patient) or arrays aligned with visit_dates.
+    The single definition of a valid landmark -- used by sample_landmark() and by the
+    real-data loader (compass.data.loader) to drop patients with no valid candidate."""
+    dates = pd.to_datetime(pd.Series(visit_dates)).to_numpy()
+    index_date, death_date = _as_datetime64(index_date), _as_datetime64(death_date)
+    return (dates >= index_date) & (np.isnat(death_date) | (dates < death_date))
+
+
 def sample_landmark(
-    patient_visits: pd.DataFrame, rng: np.random.Generator, *, death_date: pd.Timestamp
+    patient_visits: pd.DataFrame, rng: np.random.Generator, *, index_date: pd.Timestamp, death_date: pd.Timestamp
 ) -> pd.Timestamp:
     """Sample one random landmark time from a single patient's own visit dates.
 
-    Candidate landmarks on or after death_date are dropped (pass NaT/None for a patient
-    who did not die). If only one candidate remains, it IS the landmark. Raises if no visit
-    precedes death -- the loader/validator guarantee death is strictly after index.
+    Candidates are visits on/after index_date and before death_date (see
+    landmark_candidate_mask; pass NaT/None death_date for a patient who did not die). If
+    only one candidate remains, it IS the landmark. Raises if there is none -- the loader
+    drops such patients before training.
     """
     visit_dates = patient_visits["visit_date"].to_numpy()
-    if death_date is not None and pd.notna(death_date):
-        visit_dates = visit_dates[visit_dates < np.datetime64(pd.Timestamp(death_date))]
+    visit_dates = visit_dates[landmark_candidate_mask(visit_dates, index_date, death_date)]
     if len(visit_dates) == 0:
-        raise ValueError("sample_landmark: no visit before death_date -- no valid landmark for this patient")
+        raise ValueError("sample_landmark: no visit on/after index_date and before death_date -- no valid landmark")
     idx = rng.integers(0, len(visit_dates))
     return pd.Timestamp(visit_dates[idx])
 

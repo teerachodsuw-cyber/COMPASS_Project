@@ -17,10 +17,10 @@ as training all three via one `--model all` invocation, as long as --n-patients/
 This matters because the paired bootstrap comparison downstream needs all three models
 evaluated on comparable data.
 
-Data source: synthetic only, for now (no real-data loader exists yet -- see README's Status
-section). --n-patients/--data-seed control the synthetic cohort; configs/training.yaml's own
-`seed` controls the train/val/test split and all landmark sampling, independent of
---data-seed.
+Data source: synthetic by default (--n-patients/--data-seed control the synthetic cohort).
+--data <dir> instead reads the real-data cohort built by scripts/build_cohort.py
+(<dir>/cohort_visits.parquet + cohort_outcomes.parquet). configs/training.yaml's own `seed`
+controls the train/val/test split and all landmark sampling, independent of --data-seed.
 """
 
 import argparse
@@ -137,6 +137,8 @@ def main():
     parser.add_argument("--data-seed", type=int, default=None, help="Defaults to configs/training.yaml's seed if unset.")
     parser.add_argument("--early-stopping-patience", type=int, default=None)
     parser.add_argument("--checkpoint-every-n-epochs", type=int, default=1)
+    parser.add_argument("--data", type=str, default=None,
+                        help="Processed real-data dir (from scripts/build_cohort.py). Omit for synthetic data.")
     args = parser.parse_args()
 
     with open("configs/data_schema.yaml") as f:
@@ -144,8 +146,12 @@ def main():
     with open("configs/training.yaml") as f:
         training_config = yaml.safe_load(f)
 
-    data_seed = args.data_seed if args.data_seed is not None else training_config["seed"]
-    visits_df, outcomes_df = generate_synthetic_cohort(n_patients=args.n_patients, seed=data_seed)
+    if args.data:
+        visits_df = pd.read_parquet(f"{args.data}/cohort_visits.parquet")
+        outcomes_df = pd.read_parquet(f"{args.data}/cohort_outcomes.parquet")
+    else:
+        data_seed = args.data_seed if args.data_seed is not None else training_config["seed"]
+        visits_df, outcomes_df = generate_synthetic_cohort(n_patients=args.n_patients, seed=data_seed)
 
     names = list(MODEL_REGISTRY.keys()) if args.model == "all" else [args.model]
     results = {}

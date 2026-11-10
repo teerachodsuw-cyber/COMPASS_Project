@@ -268,3 +268,25 @@ def test_error_messages_do_not_list_patient_ids(valid_cohort, break_outcomes):
     for pid in offending_ids:
         assert pid not in message
     assert "SYN" not in message  # no synthetic patient ID of any kind
+
+
+# ---- event-date bounds: > index_date, <= cutoff; no calendar lower bound -------------------
+
+
+def test_event_between_pre_window_index_and_window_start_passes(valid_cohort):
+    # index_date before the 2013-06-01 visit window; incident MALO event before the window start
+    visits_df, outcomes_df = valid_cohort
+    ok = outcomes_df.copy()
+    [(row, _)] = _clean_patients(visits_df, outcomes_df)
+    ok.loc[row, "index_date"] = pd.Timestamp("2010-01-01")
+    _set_event(ok, row, "malo", pd.Timestamp("2012-06-01"))
+    validate_dataset(visits_df, ok, config_path=CONFIG_PATH)
+
+
+def test_event_after_cutoff_raises(valid_cohort):
+    visits_df, outcomes_df = valid_cohort
+    broken = outcomes_df.copy()
+    [(row, _)] = _clean_patients(visits_df, outcomes_df)
+    _set_event(broken, row, "cvd", pd.Timestamp("2025-07-01"))
+    with pytest.raises(SchemaValidationError, match=r"^1 cvd_date value\(s\) fall after the administrative cutoff 2025-06-30"):
+        validate_dataset(visits_df, broken, config_path=CONFIG_PATH)

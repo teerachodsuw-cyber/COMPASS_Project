@@ -14,7 +14,7 @@ def test_sample_landmark_single_visit():
         }
     )
     rng = np.random.default_rng(0)
-    landmark = sample_landmark(patient_visits, rng, death_date=pd.NaT)
+    landmark = sample_landmark(patient_visits, rng, index_date=patient_visits["visit_date"].min(), death_date=pd.NaT)
     assert landmark == pd.Timestamp("2020-06-01")
 
 
@@ -23,7 +23,7 @@ def test_sample_landmark_picks_from_patient_own_visits():
     patient_visits = pd.DataFrame({"patient_id": ["P1"] * 3, "visit_date": dates})
     rng = np.random.default_rng(1)
     for _ in range(20):
-        landmark = sample_landmark(patient_visits, rng, death_date=pd.NaT)
+        landmark = sample_landmark(patient_visits, rng, index_date=patient_visits["visit_date"].min(), death_date=pd.NaT)
         assert landmark in set(dates)
 
 

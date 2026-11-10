@@ -159,18 +159,24 @@ def _check_outcome_flag_date_consistency(outcomes_df: pd.DataFrame, outcome_name
             )
 
 
-def _check_event_dates_in_range(
+def _check_event_dates_not_after_cutoff(
     outcomes_df: pd.DataFrame,
     outcome_names: list[str],
-    range_start: pd.Timestamp,
-    range_end: pd.Timestamp,
+    cutoff: pd.Timestamp,
 ) -> None:
+    """Event dates must be on/before the administrative cutoff. There is NO lower calendar
+    bound for events: the lower bound is index_date (rule 3c, strictly after index), and
+    index_date can precede the visit window (cohort.date_range), so an incident event can
+    fall between a pre-window index_date and the window start. The visit-date window is
+    checked separately (_check_visit_dates)."""
     for name in outcome_names:
         event_col, date_col = f"{name}_event", f"{name}_date"
         dates = pd.to_datetime(outcomes_df.loc[outcomes_df[event_col] == 1, date_col])
-        out_of_range = (dates < range_start) | (dates > range_end)
-        if out_of_range.any():
-            raise SchemaValidationError(f"{int(out_of_range.sum())} {date_col} value(s) fall outside the cohort date_range")
+        after_cutoff = dates > cutoff
+        if after_cutoff.any():
+            raise SchemaValidationError(
+                f"{int(after_cutoff.sum())} {date_col} value(s) fall after the administrative cutoff {cutoff.date()}"
+            )
 
 
 def _check_date_order(visits_df: pd.DataFrame, outcomes_df: pd.DataFrame, outcome_names: list[str]) -> None:
@@ -263,6 +269,6 @@ def validate_dataset(
     _check_unique_patient_visit(visits_df)
     _check_outcome_structure(outcomes_df)
     _check_outcome_flag_date_consistency(outcomes_df, outcome_names)
-    _check_event_dates_in_range(outcomes_df, outcome_names, range_start, range_end)
+    _check_event_dates_not_after_cutoff(outcomes_df, outcome_names, pd.Timestamp(schema["censoring"]["administrative_cutoff"]))
     _check_one_outcomes_row_per_patient(visits_df, outcomes_df)  # before date-order rules, which assume one row per patient
     _check_date_order(visits_df, outcomes_df, outcome_names)

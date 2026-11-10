@@ -174,7 +174,9 @@ class Trainer:
         for pid in patient_ids:
             patient_visits = self._visits_by_patient[pid]
             patient_outcomes = self._outcomes_indexed.loc[pid]
-            landmark_date = sample_landmark(patient_visits, rng, death_date=death_date_of(patient_outcomes))
+            landmark_date = sample_landmark(
+                patient_visits, rng, index_date=patient_outcomes["index_date"], death_date=death_date_of(patient_outcomes)
+            )
             raw_examples.append(construct_landmark_example(patient_visits, patient_outcomes, landmark_date, self.horizons))
         return scale_and_mask_examples(
             raw_examples, self.scalers, self.continuous_columns, self.medication_columns,
