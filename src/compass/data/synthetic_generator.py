@@ -45,6 +45,9 @@ DEFAULT_CVD_RATE = 0.10
 # Intentionally rare -- matches the real rare-event problem this project has to
 # handle. Do not "fix" this by balancing it toward 50/50.
 DEFAULT_MALO_RATE = 0.02
+# Share of patients at risk for incident CVD (no prevalent CVD at index). Placeholder
+# pending Stage 1; the real loader derives cvd_at_risk from cad/stroke/hf/pvd_prev.
+DEFAULT_CVD_AT_RISK_RATE = 0.85
 
 
 def _load_schema(config_path: str) -> dict:
@@ -60,11 +63,17 @@ def generate_synthetic_cohort(
     mortality_rate: float = DEFAULT_MORTALITY_RATE,
     cvd_rate: float = DEFAULT_CVD_RATE,
     malo_rate: float = DEFAULT_MALO_RATE,
+    cvd_at_risk_rate: float = DEFAULT_CVD_AT_RISK_RATE,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Generate a synthetic patient-visit cohort matching configs/data_schema.yaml.
 
     Returns (visits_df, outcomes_df): one row per patient-visit, and one row per
-    patient with static semi-competing-risks outcome fields.
+    patient with static semi-competing-risks outcome fields, index_date (the first
+    visit, a synthetic simplification) and cvd_at_risk (0/1).
+
+    The outcomes satisfy compass.data.validate_schema's date-order rules: every event
+    is strictly after index_date, death is on or after the last visit and on or after
+    any MALO/CVD event, and patients with cvd_at_risk == 0 have no CVD event.
     """
     schema = _load_schema(config_path)
     rng = np.random.default_rng(seed)
@@ -94,12 +103,14 @@ def generate_synthetic_cohort(
 
     visit_rows = []
     first_visit_date = {}
+    last_visit_date = {}
     for i, pid in enumerate(patient_ids):
         # Sampled without replacement: a patient cannot have two visits on the
         # same day (visit_date must be unique per patient_id).
         offsets = rng.choice(range_days + 1, size=n_visits[i], replace=False)
         visit_dates = sorted(range_start + pd.to_timedelta(offsets, unit="D"))
         first_visit_date[pid] = visit_dates[0]
+        last_visit_date[pid] = visit_dates[-1]
 
         for visit_date in visit_dates:
             row = {
@@ -129,31 +140,29 @@ def generate_synthetic_cohort(
     visits_df = pd.DataFrame(visit_rows)
 
     def _sample_event_date(lower: pd.Timestamp) -> pd.Timestamp:
+        """Uniform date in [lower, range_end] (lower is inclusive); NaT if that is empty."""
         lower = max(lower, range_start)
-        if lower >= range_end:
-            return range_end
+        if lower > range_end:
+            return pd.NaT
         offset = rng.integers(0, (range_end - lower).days + 1)
         return lower + pd.Timedelta(days=int(offset))
 
+    one_day = pd.Timedelta(days=1)
     outcome_rows = []
     for pid in patient_ids:
-        fvd = first_visit_date[pid]
+        index_date = first_visit_date[pid]  # synthetic simplification: index = first visit
+        after_index = index_date + one_day  # events must be strictly after index
 
-        malo_event = int(rng.random() < malo_rate)
-        malo_date = _sample_event_date(fvd) if malo_event else pd.NaT
+        cvd_at_risk = int(rng.random() < cvd_at_risk_rate)
 
-        cvd_event = int(rng.random() < cvd_rate)
-        cvd_date = _sample_event_date(fvd) if cvd_event else pd.NaT
+        malo_date = _sample_event_date(after_index) if rng.random() < malo_rate else pd.NaT
+        # Not at risk (prevalent CVD at index) -> no incident CVD event.
+        cvd_date = _sample_event_date(after_index) if (cvd_at_risk and rng.random() < cvd_rate) else pd.NaT
 
-        mortality_event = int(rng.random() < mortality_rate)
-        if mortality_event:
-            # Mortality date can't logically precede a non-fatal outcome for the
-            # same patient (synthetic simplification, not clinically rigorous).
-            lower_bound = fvd
-            if malo_event:
-                lower_bound = max(lower_bound, malo_date)
-            if cvd_event:
-                lower_bound = max(lower_bound, cvd_date)
+        if rng.random() < mortality_rate:
+            # Death can't precede the last visit or a non-fatal outcome for the same patient
+            # (synthetic simplification, not clinically rigorous).
+            lower_bound = max([last_visit_date[pid], after_index] + [d for d in (malo_date, cvd_date) if pd.notna(d)])
             mortality_date = _sample_event_date(lower_bound)
         else:
             mortality_date = pd.NaT
@@ -161,12 +170,14 @@ def generate_synthetic_cohort(
         outcome_rows.append(
             {
                 "patient_id": pid,
-                "mortality_event": mortality_event,
+                "index_date": index_date,
+                "mortality_event": int(pd.notna(mortality_date)),
                 "mortality_date": mortality_date,
-                "malo_event": malo_event,
+                "malo_event": int(pd.notna(malo_date)),
                 "malo_date": malo_date,
-                "cvd_event": cvd_event,
+                "cvd_event": int(pd.notna(cvd_date)),
                 "cvd_date": cvd_date,
+                "cvd_at_risk": cvd_at_risk,
             }
         )
 
@@ -176,7 +187,7 @@ def generate_synthetic_cohort(
 
 
 if __name__ == "__main__":
-    sample_visits, sample_outcomes = generate_synthetic_cohort(n_patients=50, seed=42)
+    sample_visits, sample_outcomes = generate_synthetic_cohort(n_patients=200, seed=42)
     out_dir = Path("data/synthetic")
     out_dir.mkdir(parents=True, exist_ok=True)
     sample_visits.to_csv(out_dir / "sample_cohort.csv", index=False)

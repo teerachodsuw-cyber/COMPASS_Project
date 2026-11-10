@@ -115,10 +115,11 @@ def test_no_patient_overlap_across_splits():
 
 
 def test_committed_sample_cohort_now_stratifies():
-    """The committed data/synthetic/sample_outcomes.csv (n=50) previously failed under the
-    old joint-8-way stratification (one combination had only 1 patient). Under marginal
-    stratification it succeeds: each outcome individually has enough positive cases
-    (mortality=7, malo=2, cvd=5) to clear the 2-per-label minimum. This documents that the
+    """The original committed sample (n=50) failed under the old joint-8-way stratification
+    (one combination had only 1 patient). The current committed
+    data/synthetic/sample_outcomes.csv (n=200, seed 42) splits under marginal
+    stratification: each outcome individually has enough positive cases
+    (mortality=34, malo=3, cvd=20) to clear the 2-per-label minimum. This documents that the
     fix actually raised the usable floor, not just moved where the failure text appears.
     """
     outcomes_df = pd.read_csv("data/synthetic/sample_outcomes.csv")
