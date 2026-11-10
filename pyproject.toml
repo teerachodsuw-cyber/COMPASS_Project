@@ -32,3 +32,10 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    # numpy 2 deprecated np.trapz; sksurv's own integrated_brier_score still calls it.
+    # Silences ONLY that warning, ONLY when raised from inside sksurv.metrics.
+    "ignore:`trapz` is deprecated:DeprecationWarning:sksurv\\.metrics",
+]

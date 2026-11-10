@@ -60,18 +60,17 @@ def construct_landmark_example(
     patient_visits: pd.DataFrame,
     patient_outcomes: pd.Series,
     landmark_date: pd.Timestamp,
-    horizons: list[int],
 ) -> dict:
-    """Construct one training example anchored at landmark_date.
+    """Construct one example anchored at landmark_date.
 
     - input_visits: all of patient_visits with visit_date <= landmark_date, chronologically
       ordered. Nothing dated after landmark_date is included.
-    - outcome_labels: {outcome_name: {horizon: 0/1}} -- 1 iff that outcome's own event_date
-      falls strictly after landmark_date and on/before landmark_date + horizon years. mortality
-      /malo/cvd are evaluated independently from their own event_date/event_flag (not
-      mutually exclusive, not composited) -- the semi-competing-risks ordering (mortality
-      can't precede a non-fatal outcome) is already enforced upstream in how event dates are
-      generated/validated, so no additional adjustment is needed here.
+
+    No outcome labels are attached here. Outcome times, event / competing / censoring status
+    and at-risk flags come ONLY from compass.training.targets.build_targets (used by training
+    and evaluation alike). The censoring-blind per-horizon 0/1 labels this function used to
+    produce were removed: they ignored censoring and competing death, so nothing may use them.
+    patient_outcomes is accepted for interface stability but not read.
     """
     landmark_date = pd.Timestamp(landmark_date)
 
@@ -80,27 +79,10 @@ def construct_landmark_example(
         .sort_values("visit_date")
         .reset_index(drop=True)
     )
-
-    outcome_labels = {}
-    for name in OUTCOME_NAMES:
-        event_flag = patient_outcomes[f"{name}_event"]
-        event_date = patient_outcomes[f"{name}_date"]
-        event_date = pd.Timestamp(event_date) if pd.notna(event_date) else pd.NaT
-
-        horizon_labels = {}
-        for h in horizons:
-            window_end = landmark_date + pd.DateOffset(years=h)
-            occurred_in_window = (
-                bool(event_flag) and pd.notna(event_date) and landmark_date < event_date <= window_end
-            )
-            horizon_labels[h] = int(occurred_in_window)
-        outcome_labels[name] = horizon_labels
-
     patient_id = patient_visits["patient_id"].iloc[0]
 
     return {
         "patient_id": patient_id,
         "landmark_date": landmark_date,
         "input_visits": input_visits,
-        "outcome_labels": outcome_labels,
     }

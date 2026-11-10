@@ -8,6 +8,10 @@ was never actually required: each cause-specific model head learns from patients
 that specific outcome's status, regardless of the other two outcomes' status.
 """
 
+import hashlib
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
@@ -82,3 +86,62 @@ def patient_level_split(
     assert set(val_ids).isdisjoint(test_ids)
 
     return train_ids, val_ids, test_ids
+
+
+# ---- split pinning: the split is saved at training time and reused at evaluation -------
+
+SPLIT_FILE = "split.json"
+
+
+class SplitMismatchError(ValueError):
+    """The data given at evaluation is not the data the saved split was made from."""
+
+
+def data_fingerprint(visits_df: pd.DataFrame, outcomes_df: pd.DataFrame) -> dict:
+    """Aggregate fingerprint of the input data: visit row count, patient count, and a
+    SHA-256 of the sorted patient IDs (no IDs themselves)."""
+    ids = sorted(str(pid) for pid in outcomes_df["patient_id"].unique())
+    return {
+        "visit_rows": int(len(visits_df)),
+        "patients": len(ids),
+        "patient_id_sha256": hashlib.sha256("\n".join(ids).encode()).hexdigest(),
+    }
+
+
+def _plain(pid):
+    return pid.item() if isinstance(pid, np.generic) else pid
+
+
+def save_split(directory, train_ids: list, val_ids: list, test_ids: list, fingerprint: dict, seed: int) -> Path:
+    """Write <directory>/split.json: patient IDs per split, the data fingerprint, and the
+    seed used for landmark sampling. The run directory is git-ignored (patient IDs)."""
+    path = Path(directory) / SPLIT_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "train": [_plain(p) for p in train_ids],
+        "val": [_plain(p) for p in val_ids],
+        "test": [_plain(p) for p in test_ids],
+        "seed": int(seed),
+        "fingerprint": fingerprint,
+    }
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def load_split(directory) -> dict:
+    path = Path(directory) / SPLIT_FILE
+    if not path.exists():
+        raise SplitMismatchError(f"no saved split at {path} -- train with the current code first (fit() writes it)")
+    return json.loads(path.read_text())
+
+
+def check_fingerprint(saved: dict, current: dict) -> None:
+    """Raise SplitMismatchError (naming the differing fields, counts only) if the data
+    differs from the data the split was saved from."""
+    diffs = [k for k in ("visit_rows", "patients", "patient_id_sha256") if saved.get(k) != current.get(k)]
+    if diffs:
+        detail = ", ".join(
+            f"{k}: saved {saved.get(k)} vs given {current.get(k)}" if k != "patient_id_sha256" else "patient ID hash differs"
+            for k in diffs
+        )
+        raise SplitMismatchError(f"the data given does not match the data this run was trained on ({detail})")

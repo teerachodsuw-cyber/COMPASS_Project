@@ -32,56 +32,8 @@ import yaml
 
 from compass.data.preprocessing import build_feature_names
 from compass.data.synthetic_generator import generate_synthetic_cohort
-from compass.models.dynamic_deephit.model import DynamicDeepHitModel
-from compass.models.survlatent_ode.model import SurvLatentODEModel
-from compass.models.tracer.model import TracerModel
+from compass.models.registry import MODEL_REGISTRY, build_model
 from compass.training.train import Trainer
-
-MODEL_REGISTRY = {
-    "dynamic_deephit": (DynamicDeepHitModel, "configs/model_dynamic_deephit.yaml"),
-    "tracer": (TracerModel, "configs/model_tracer.yaml"),
-    "survlatent_ode": (SurvLatentODEModel, "configs/model_survlatent_ode.yaml"),
-}
-
-
-def _build_model(name: str, model_config: dict, num_features: int, horizon_years: float):
-    model_cls, _ = MODEL_REGISTRY[name]
-    if name == "dynamic_deephit":
-        return model_cls(
-            num_features=num_features,
-            hidden_dim=model_config["hidden_dim"],
-            num_gru_layers=model_config["num_layers"],
-            cause_head_hidden_dim=model_config["cause_head_hidden_dim"],
-            num_time_bins=model_config["num_time_bins"],
-            bin_width_years=model_config["bin_width_years"],
-            ranking_weight=model_config["ranking_weight"],
-            auxiliary_weight=model_config["auxiliary_weight"],
-            horizon_years=horizon_years,
-        )
-    if name == "tracer":
-        return model_cls(
-            num_features=num_features,
-            feature_embed_dim=model_config["feature_embed_dim"],
-            covariate_attention_heads=model_config["covariate_attention_heads"],
-            hidden_dim=model_config["hidden_dim"],
-            temporal_attention_heads=model_config["temporal_attention_heads"],
-            num_transformer_layers=model_config["num_transformer_layers"],
-            cause_head_hidden_dim=model_config["cause_head_hidden_dim"],
-            num_time_bins=model_config["num_time_bins"],
-            bin_width_years=model_config["bin_width_years"],
-        )
-    if name == "survlatent_ode":
-        return model_cls(
-            num_features=num_features,
-            latent_dim=model_config["latent_dim"],
-            ode_hidden_dim=model_config["ode_hidden_dim"],
-            cause_head_hidden_dim=model_config["cause_head_hidden_dim"],
-            num_time_bins=model_config["num_time_bins"],
-            bin_width_years=model_config["bin_width_years"],
-            solver_method=model_config["solver_method"],
-        )
-    raise ValueError(f"unknown model name: {name}")
-
 
 def train_one_model(name: str, args, visits_df, outcomes_df, schema, training_config) -> dict:
     with open(MODEL_REGISTRY[name][1]) as f:
@@ -96,7 +48,7 @@ def train_one_model(name: str, args, visits_df, outcomes_df, schema, training_co
     horizons = [int(training_config["horizons"]["primary"])]
 
     torch.manual_seed(training_config["seed"])
-    model = _build_model(name, model_config, num_features, horizon_years=horizons[0])
+    model = build_model(name, model_config, num_features, horizon_years=horizons[0])
 
     trainer = Trainer(
         model=model,
@@ -123,9 +75,11 @@ def train_one_model(name: str, args, visits_df, outcomes_df, schema, training_co
         checkpoint_every_n_epochs=args.checkpoint_every_n_epochs,
     )
 
-    test_metrics = trainer.evaluate(trainer.test_ids, resample_landmarks=False)
-    print(f"{name}: final train total={history['train'][-1]['total']:.4f}  val total={history['val'][-1]['total']:.4f}  test total={test_metrics['total']:.4f}")
-    return {"history": history, "test_metrics": test_metrics, "split": {"train": trainer.train_ids, "val": trainer.val_ids, "test": trainer.test_ids}}
+    # fit() has reloaded checkpoint_best.pt. No test-split loss is computed here: the test
+    # split is touched only by scripts/evaluate.py --split test --final (one-time reporting).
+    print(f"{name}: final train total={history['train'][-1]['total']:.4f}  val total={history['val'][-1]['total']:.4f}  "
+          f"best epoch={history.get('best_epoch')} (val total={history.get('best_val_loss', float('nan')):.4f}, weights reloaded)")
+    return {"history": history, "split": {"train": trainer.train_ids, "val": trainer.val_ids, "test": trainer.test_ids}}
 
 
 def main():
@@ -166,7 +120,11 @@ def main():
 
     summary_path = f"{args.checkpoint_dir}/run_summary.json"
     with open(summary_path, "w") as f:
-        json.dump({name: {"test_metrics": results[name]["test_metrics"]} for name in names}, f, indent=2)
+        json.dump(
+            {name: {"best_epoch": results[name]["history"].get("best_epoch"),
+                    "best_val_loss": results[name]["history"].get("best_val_loss")} for name in names},
+            f, indent=2,
+        )
     print(f"Summary written to {summary_path}")
 
 

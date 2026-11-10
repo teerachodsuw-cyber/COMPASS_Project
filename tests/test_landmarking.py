@@ -47,12 +47,10 @@ def test_construct_landmark_example_structure():
         }
     )
 
-    example = construct_landmark_example(patient_visits, patient_outcomes, landmark_date, horizons=[10, 20])
+    example = construct_landmark_example(patient_visits, patient_outcomes, landmark_date)
 
     assert example["patient_id"] == "P1"
     assert example["landmark_date"] == landmark_date
     assert list(example["input_visits"]["visit_date"]) == list(pd.to_datetime(["2015-01-01", "2016-01-01"]))
-    assert set(example["outcome_labels"].keys()) == {"mortality", "malo", "cvd"}
-    for name in ("mortality", "malo", "cvd"):
-        assert set(example["outcome_labels"][name].keys()) == {10, 20}
-        assert all(v in (0, 1) for v in example["outcome_labels"][name].values())
+    # censoring-blind outcome labels were removed: targets come only from build_targets
+    assert "outcome_labels" not in example

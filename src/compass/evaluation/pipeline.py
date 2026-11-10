@@ -1,0 +1,148 @@
+"""Evaluation pipeline: best-checkpoint models -> predict_risk on a split's FIXED landmarks
+-> ground truth from build_targets -> metrics -> paired bootstrap. Used by
+scripts/evaluate.py; everything here returns aggregates only.
+
+- Ground truth comes only from compass.training.targets.build_targets (via
+  collate_examples): time, event, competing death, at_risk. Event codes for the metrics:
+  1 = event, 2 = competing death (MALO / CVD), 0 = censored. at_risk == 0 rows are excluded
+  per outcome (inside compute_all_metrics).
+- IPCW censoring reference = the TRAINING split's survival data (its fixed, seed-sampled
+  landmarks, at-risk rows only) -- never the split being evaluated.
+- All models are evaluated on the same patients and landmarks (same split seed); this is
+  checked, not assumed.
+"""
+
+import numpy as np
+import torch
+
+from compass.evaluation.bootstrap import paired_bootstrap
+from compass.evaluation.metrics import compute_all_metrics
+from compass.models.base import DEATH_OUTCOME, OUTCOME_NAMES
+from compass.training.batching import collate_examples
+from compass.training.targets import DAYS_PER_YEAR
+
+
+def ground_truth_from_targets(batch: dict) -> dict:
+    """{outcome: {"time_years", "event_type", "at_risk"}} from a collate_examples batch."""
+    gt = {}
+    for name in OUTCOME_NAMES:
+        event = batch[f"{name}_event_indicator"].numpy().astype(bool)
+        competing = batch[f"{name}_competing_indicator"].numpy().astype(bool)
+        gt[name] = {
+            "time_years": batch[f"{name}_target_days"].numpy().astype(float) / DAYS_PER_YEAR,
+            "event_type": np.where(event, 1, np.where(competing, 2, 0)).astype(int),
+            "at_risk": batch[f"{name}_at_risk"].numpy().astype(bool),
+        }
+    return gt
+
+
+def _concat_gt(parts: list[dict]) -> dict:
+    return {name: {k: np.concatenate([p[name][k] for p in parts]) for k in parts[0][name]} for name in OUTCOME_NAMES}
+
+
+def _collate(trainer, examples: list[dict]) -> dict:
+    return collate_examples(
+        examples, trainer.outcomes_df, trainer.administrative_cutoff, trainer.bin_width_years, trainer.num_time_bins,
+        last_visit_dates=trainer.last_visit_dates,
+    )
+
+
+def split_ground_truth(trainer, split: str) -> tuple[list, dict]:
+    """(patient_ids, ground truth) for a split's fixed landmark examples."""
+    examples = trainer.fixed_examples(split)
+    parts = [ground_truth_from_targets(_collate(trainer, examples[i : i + trainer.batch_size]))
+             for i in range(0, len(examples), trainer.batch_size)]
+    return [ex["patient_id"] for ex in examples], _concat_gt(parts)
+
+
+def censoring_reference_from_train(trainer) -> dict:
+    """{outcome: {"time_years", "event_type"}} from the TRAINING split, at-risk rows only."""
+    _, gt = split_ground_truth(trainer, "train")
+    return {
+        name: {"time_years": g["time_years"][g["at_risk"]], "event_type": g["event_type"][g["at_risk"]]}
+        for name, g in gt.items()
+    }
+
+
+@torch.no_grad()
+def predict_cifs(model, trainer, split: str, horizon: int) -> dict:
+    """{outcome: (n, horizon) CIF at yearly bins 1..horizon} via model.predict_risk."""
+    model.eval()
+    examples = trainer.fixed_examples(split)
+    horizons = list(range(1, int(horizon) + 1))
+    chunks = []
+    for i in range(0, len(examples), trainer.batch_size):
+        b = _collate(trainer, examples[i : i + trainer.batch_size])
+        chunks.append(model.predict_risk(b["values"], b["mask"], b["seq_lengths"], horizons, b["elapsed_days"]).numpy())
+    risk = np.concatenate(chunks, axis=0)  # (n, 3, horizon)
+    return {name: risk[:, k, :] for k, name in enumerate(OUTCOME_NAMES)}
+
+
+def outcome_counts(ground_truth: dict, horizon: int) -> dict:
+    out = {}
+    for name, g in ground_truth.items():
+        r = g["at_risk"]
+        within = g["time_years"] <= horizon
+        out[name] = {
+            "n_at_risk": int(r.sum()),
+            "n_events": int((r & within & (g["event_type"] == 1)).sum()),
+            "n_competing": int((r & within & (g["event_type"] == 2)).sum()) if name != DEATH_OUTCOME else 0,
+        }
+    return out
+
+
+def evaluate_models(trainers: dict, models: dict, split: str, horizon: int, n_bootstrap: int, seed: int) -> dict:
+    """trainers / models: {model_name: Trainer / model with best-checkpoint weights loaded}.
+    Returns a JSON-serialisable dict of aggregates."""
+    names = list(models)
+    ref_trainer = trainers[names[0]]
+    patient_ids, ground_truth = split_ground_truth(ref_trainer, split)
+    for name in names[1:]:
+        other_ids, _ = split_ground_truth(trainers[name], split)
+        if other_ids != patient_ids:
+            raise ValueError(f"model '{name}' was evaluated on a different {split} split / patient order")
+    reference = censoring_reference_from_train(ref_trainer)
+    predictions = {name: predict_cifs(models[name], trainers[name], split, horizon) for name in names}
+
+    per_model, pairwise = paired_bootstrap(predictions, ground_truth, reference, horizon, n_iterations=n_bootstrap, seed=seed)
+    return {
+        "split": split,
+        "horizon_years": int(horizon),
+        "n_patients": len(patient_ids),
+        "n_bootstrap": int(n_bootstrap),
+        "bootstrap_seed": int(seed),
+        "ipcw_reference": {"split": "train", "n_at_risk": {k: int(len(v["time_years"])) for k, v in reference.items()}},
+        "counts": outcome_counts(ground_truth, horizon),
+        "per_model": per_model.to_dict(orient="records"),
+        "pairwise": pairwise.to_dict(orient="records"),
+    }
+
+
+def _fmt(row) -> str:
+    if np.isnan(row["point_estimate"]):
+        return f"n/a (no events) [n_valid {row['n_valid']}]"
+    return f"{row['point_estimate']:.3f} ({row['ci_lower']:.3f} to {row['ci_upper']:.3f}) [n_valid {row['n_valid']}]"
+
+
+def format_tables(results: dict) -> str:
+    counts = results["counts"]
+    lines = [
+        f"Split: {results['split']} | horizon {results['horizon_years']} yr | patients {results['n_patients']} | "
+        f"bootstrap {results['n_bootstrap']} draws | IPCW reference: train split",
+        "",
+        "| Model | Outcome | C-index (95% CI) | IBS (95% CI) | n at risk | n events |",
+        "|---|---|---|---|---|---|",
+    ]
+    rows = {(r["model"], r["outcome"], r["metric_name"]): r for r in results["per_model"]}
+    models = list(dict.fromkeys(r["model"] for r in results["per_model"]))
+    for m in models:
+        for o in OUTCOME_NAMES:
+            lines.append(f"| {m} | {o} | {_fmt(rows[(m, o, 'cindex')])} | {_fmt(rows[(m, o, 'ibs')])} | "
+                         f"{counts[o]['n_at_risk']} | {counts[o]['n_events']} |")
+    if results["pairwise"]:
+        lines += ["", "| Comparison | Outcome | Δ C-index (95% CI) | Δ IBS (95% CI) |", "|---|---|---|---|"]
+        prow = {(r["comparison"], r["outcome"], r["metric_name"]): r for r in results["pairwise"]}
+        for c in dict.fromkeys(r["comparison"] for r in results["pairwise"]):
+            for o in OUTCOME_NAMES:
+                lines.append(f"| {c} | {o} | {_fmt(prow[(c, o, 'cindex')])} | {_fmt(prow[(c, o, 'ibs')])} |")
+    return "\n".join(lines)

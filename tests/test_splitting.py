@@ -45,3 +45,22 @@ def test_marginal_rates_preserved_across_splits():
         for ids in (train_ids, val_ids, test_ids):
             split_rate = outcomes_df.loc[outcomes_df["patient_id"].isin(ids), col].mean()
             assert abs(split_rate - overall_rate) < 0.05
+
+
+def test_data_fingerprint_and_check():
+    import pandas as pd
+    import pytest
+
+    from compass.data.splitting import SplitMismatchError, check_fingerprint, data_fingerprint
+
+    outcomes = pd.DataFrame({"patient_id": ["A", "B", "C"]})
+    visits = pd.DataFrame({"patient_id": ["A", "A", "B", "C"]})
+    fp = data_fingerprint(visits, outcomes)
+    assert fp["visit_rows"] == 4 and fp["patients"] == 3
+    assert "A" not in str(fp)  # aggregates + hash only, no IDs
+    assert data_fingerprint(visits.iloc[::-1], outcomes.iloc[::-1]) == fp  # order-independent
+    check_fingerprint(fp, fp)
+    with pytest.raises(SplitMismatchError, match="visit_rows: saved 4 vs given 3"):
+        check_fingerprint(fp, data_fingerprint(visits.iloc[:3], outcomes))
+    with pytest.raises(SplitMismatchError, match="patient ID hash differs"):
+        check_fingerprint(fp, data_fingerprint(visits, pd.DataFrame({"patient_id": ["A", "B", "D"]})))

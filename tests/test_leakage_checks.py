@@ -12,6 +12,7 @@ from compass.data.landmarking import construct_landmark_example
 from compass.data.scaling import apply_scalers, fit_scalers
 from compass.data.splitting import patient_level_split
 from compass.data.synthetic_generator import generate_synthetic_cohort
+from compass.training.targets import build_targets
 
 
 def _no_event_outcomes() -> pd.Series:
@@ -37,7 +38,7 @@ def test_no_post_landmark_input_leakage():
     )
     landmark_date = pd.Timestamp("2016-01-01")
 
-    example = construct_landmark_example(patient_visits, _no_event_outcomes(), landmark_date, horizons=[10])
+    example = construct_landmark_example(patient_visits, _no_event_outcomes(), landmark_date)
     input_visits = example["input_visits"]
 
     assert (input_visits["visit_date"] <= landmark_date).all()
@@ -46,39 +47,33 @@ def test_no_post_landmark_input_leakage():
     assert len(input_visits) == 2
 
 
+def _targets_for(patient_outcomes: pd.Series, landmark_date, last_visit) -> dict:
+    """Outcome targets come only from build_targets (no labels on the landmark example)."""
+    outcomes = pd.DataFrame([{"patient_id": "P1", "cvd_at_risk": 1, **patient_outcomes.to_dict()}])
+    return build_targets(["P1"], [landmark_date], outcomes, pd.Series({"P1": pd.Timestamp(last_visit)}),
+                         pd.Timestamp("2025-06-30"), 1.0, 13)
+
+
 def test_outcome_window_starts_strictly_after_landmark():
-    patient_visits = pd.DataFrame(
-        {
-            "patient_id": ["P1"],
-            "visit_date": pd.to_datetime(["2016-01-01"]),
-            "bmi": [22.0],
-        }
-    )
     landmark_date = pd.Timestamp("2016-01-01")
     patient_outcomes = pd.Series(
         {
             "mortality_event": 1,
             "mortality_date": pd.Timestamp("2016-01-01"),  # event ON the landmark date
-            "malo_event": 0,
-            "malo_date": pd.NaT,
+            "malo_event": 1,
+            "malo_date": pd.Timestamp("2016-01-01"),       # event ON the landmark date
             "cvd_event": 0,
             "cvd_date": pd.NaT,
         }
     )
-
-    example = construct_landmark_example(patient_visits, patient_outcomes, landmark_date, horizons=[10])
-
-    assert example["outcome_labels"]["mortality"][10] == 0
+    t = _targets_for(patient_outcomes, landmark_date, last_visit="2016-01-01")
+    # an event on the landmark date is never an event for that landmark (not at risk)
+    for name in ("mortality", "malo"):
+        assert t[f"{name}_event_indicator"].item() == 0
+        assert t[f"{name}_at_risk"].item() == 0
 
 
 def test_semi_competing_risks_respected():
-    patient_visits = pd.DataFrame(
-        {
-            "patient_id": ["P1"],
-            "visit_date": pd.to_datetime(["2015-01-01"]),
-            "bmi": [22.0],
-        }
-    )
     landmark_date = pd.Timestamp("2015-01-01")
     patient_outcomes = pd.Series(
         {
@@ -90,12 +85,11 @@ def test_semi_competing_risks_respected():
             "cvd_date": pd.Timestamp("2018-01-01"),
         }
     )
-
-    example = construct_landmark_example(patient_visits, patient_outcomes, landmark_date, horizons=[10])
-
-    assert example["outcome_labels"]["malo"][10] == 1
-    assert example["outcome_labels"]["cvd"][10] == 1
-    assert example["outcome_labels"]["mortality"][10] == 1
+    t = _targets_for(patient_outcomes, landmark_date, last_visit="2019-01-01")
+    # MALO and CVD both count (they do not censor each other); death counts too
+    for name in ("malo", "cvd", "mortality"):
+        assert t[f"{name}_event_indicator"].item() == 1
+        assert t[f"{name}_competing_indicator"].item() == 0
 
 
 def test_no_patient_overlap_across_splits():

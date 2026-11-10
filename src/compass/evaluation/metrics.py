@@ -19,6 +19,13 @@ num_time_bins+1)) produces for one outcome, already using base.py's shared hazar
 This one array serves both metrics: time_dependent_cindex uses a single sparse column (CIF
 at the reporting horizon), integrated_brier_score_metric uses a dense slice (CIF at every
 year up to the horizon) -- no separate prediction pass needed for the two metrics.
+
+IPCW censoring reference: every IPCW metric takes `reference` = {"time_years", "event_type"}
+for the sample the censoring distribution G is estimated from. compute_all_metrics REQUIRES
+it, and the evaluation pipeline (compass.evaluation.pipeline) always passes the TRAINING
+split's survival data -- never the split being evaluated. reference=None on the low-level
+functions falls back to the evaluated sample itself; that exists only for unit tests and the
+R pec reference fixtures (pec estimates G from the same data), not for model evaluation.
 """
 
 import numpy as np
@@ -26,11 +33,18 @@ import pandas as pd
 from lifelines import KaplanMeierFitter
 from sksurv.metrics import concordance_index_ipcw, integrated_brier_score
 
-from compass.models.base import OUTCOME_NAMES
+from compass.models.base import DEATH_OUTCOME, OUTCOME_NAMES
 
 
 def _structured_survival_array(event_indicator: np.ndarray, time: np.ndarray) -> np.ndarray:
     return np.array(list(zip(event_indicator.astype(bool), time.astype(float))), dtype=[("event", bool), ("time", float)])
+
+
+def _reference_or_self(reference: dict | None, event_time: np.ndarray, event_type: np.ndarray) -> tuple:
+    """(time, event_type) of the IPCW censoring reference; the evaluated sample if None."""
+    if reference is None:
+        return np.asarray(event_time, dtype=float), np.asarray(event_type)
+    return np.asarray(reference["time_years"], dtype=float), np.asarray(reference["event_type"])
 
 
 def time_dependent_cindex(
@@ -38,6 +52,7 @@ def time_dependent_cindex(
     event_indicator: np.ndarray,
     event_or_censoring_time: np.ndarray,
     horizon: float,
+    reference: dict | None = None,
 ) -> float:
     """Uno's C-index (concordance_index_ipcw) for one outcome at one horizon.
 
@@ -45,11 +60,9 @@ def time_dependent_cindex(
     higher = predicted higher risk, matching what concordance_index_ipcw's `estimate` param
     expects.
 
-    No separate held-out split is threaded through this function for estimating the
-    censoring distribution, so the same evaluation set's own censoring distribution is used
-    as both `survival_train` and `survival_test` -- a common practical simplification when a
-    dedicated censoring-distribution reference isn't available; it does mean the IPCW
-    weights aren't validated against an independent estimate.
+    reference: the IPCW censoring reference ({"time_years", "event_type"}; event_type 1 =
+    event, 0 = censored), passed to sksurv as `survival_train`. The evaluation pipeline
+    passes the TRAINING split; None = the evaluated sample (unit tests only).
 
     Returns NaN if the sample has zero events for this outcome. This is EXPECTED, not just
     a defensive guard: with a rare outcome (e.g. malo, ~1% base rate) and patient-level
@@ -62,17 +75,11 @@ def time_dependent_cindex(
     """
     if event_indicator.astype(bool).sum() == 0:
         return float("nan")
-    # TODO before real-data use: currently reusing the same evaluation set as both
-    # survival_train (censoring-distribution reference) and survival_test (actual
-    # evaluation cohort) for sksurv's IPCW methods. sksurv's convention expects these to
-    # ideally be separate samples -- reusing one set is a known source of mild optimistic
-    # bias, worse with small/rare-event samples (directly relevant given MALO's low
-    # incidence). Fine for synthetic proof-of-concept; must be revisited once real Stage 1
-    # data is available, likely using the full training split as survival_train regardless
-    # of which split is being evaluated.
     y = _structured_survival_array(event_indicator, event_or_censoring_time)
+    ref_time, ref_type = _reference_or_self(reference, event_or_censoring_time, event_indicator.astype(int))
+    y_ref = _structured_survival_array(ref_type == 1, ref_time)
     tau = min(float(horizon), float(event_or_censoring_time.max()))  # sksurv requires tau within the observed range
-    result = concordance_index_ipcw(y, y, cif_at_horizon, tau=tau)
+    result = concordance_index_ipcw(y_ref, y, cif_at_horizon, tau=tau)
     return float(result[0])
 
 
@@ -155,16 +162,19 @@ def _censoring_survival_at(t_unique: np.ndarray, g_at_knot: np.ndarray, query_ti
 
 
 def _censoring_ipcw_weights(
-    event_time: np.ndarray, event_type_indicator: np.ndarray, cause_of_interest: int, power: int = 2
+    event_time: np.ndarray, event_type_indicator: np.ndarray, cause_of_interest: int, power: int = 2,
+    reference: dict | None = None,
 ) -> np.ndarray:
     """Per-patient IPCW weight 1/G(t_i-)^power, at each patient's OWN observed time (left
     limit). power=2 (default) is the Uno (2011) C-index convention (wolbers_cindex);
     power=1 is the Graf/Schoop Brier score convention (schoop_competing_risks_ibs). See
     `_censoring_km_curve` for the underlying KM fit and its docstring for why it uses this
-    particular censoring-only convention rather than comprisk's.
+    particular censoring-only convention rather than comprisk's. G is fit on `reference`
+    (the training split in the evaluation pipeline) and evaluated at this sample's times.
     """
     event_time = np.asarray(event_time, dtype=float)
-    t_unique, g_at_knot = _censoring_km_curve(event_time, event_type_indicator, cause_of_interest)
+    ref_time, ref_type = _reference_or_self(reference, event_time, event_type_indicator)
+    t_unique, g_at_knot = _censoring_km_curve(ref_time, ref_type, cause_of_interest)
     g_left = _censoring_survival_at(t_unique, g_at_knot, event_time, side="left")
     g_left_safe = np.maximum(g_left, 1e-12)
     return 1.0 / (g_left_safe**power)
@@ -176,6 +186,7 @@ def wolbers_cindex(
     event_time: np.ndarray,
     horizon: float,
     cause_of_interest: int = 1,
+    reference: dict | None = None,
 ) -> float:
     """Wolbers et al. (2014, Biostatistics 15(3):526-539, eq. 3.4) cause-specific,
     IPCW-weighted concordance index at `horizon`, correctly handling a real competing risk
@@ -236,7 +247,7 @@ def wolbers_cindex(
     is_censored = event_type_indicator == 0
     is_competing = (event_type_indicator != 0) & (event_type_indicator != cause_of_interest)
 
-    weights = _censoring_ipcw_weights(event_time, event_type_indicator, cause_of_interest)
+    weights = _censoring_ipcw_weights(event_time, event_type_indicator, cause_of_interest, reference=reference)
     sqrt_weights = np.sqrt(weights)
 
     numerator = 0.0
@@ -303,6 +314,7 @@ def schoop_competing_risks_ibs(
     horizon: float,
     time_grid: np.ndarray,
     cause_of_interest: int = 1,
+    reference: dict | None = None,
 ) -> float:
     """Schoop, Beyersmann, Schumacher & Binder (2011, Biom J 53(1):88-112) competing-risks
     IPCW Brier score / integrated Brier score for `cause_of_interest`, correctly handling a
@@ -363,7 +375,8 @@ def schoop_competing_risks_ibs(
     is_competing = (event_type_indicator != 0) & (event_type_indicator != cause_of_interest)
     is_decided = is_cause | is_competing  # fate known with certainty, at the patient's own time
 
-    t_unique, g_at_knot = _censoring_km_curve(event_time, event_type_indicator, cause_of_interest)
+    ref_time, ref_type = _reference_or_self(reference, event_time, event_type_indicator)
+    t_unique, g_at_knot = _censoring_km_curve(ref_time, ref_type, cause_of_interest)  # G from the reference sample
     weight_own_time = 1.0 / np.maximum(_censoring_survival_at(t_unique, g_at_knot, event_time, side="left"), 1e-12)
     weight_at_grid = 1.0 / np.maximum(_censoring_survival_at(t_unique, g_at_knot, time_grid, side="right"), 1e-12)
 
@@ -387,7 +400,7 @@ def schoop_competing_risks_ibs(
     span = time_grid[-1] - time_grid[0]
     if span <= 0:
         return float(brier_curve[0])
-    return float(np.trapz(brier_curve, time_grid) / span)
+    return float(np.trapezoid(brier_curve, time_grid) / span)
 
 
 def integrated_brier_score_metric(
@@ -396,6 +409,7 @@ def integrated_brier_score_metric(
     event_or_censoring_time: np.ndarray,
     horizon: float,
     time_grid: np.ndarray,
+    reference: dict | None = None,
 ) -> float:
     """IBS up to `horizon`, via sksurv.metrics.integrated_brier_score.
 
@@ -414,15 +428,9 @@ def integrated_brier_score_metric(
     """
     if event_indicator.astype(bool).sum() == 0:
         return float("nan")
-    # TODO before real-data use: currently reusing the same evaluation set as both
-    # survival_train (censoring-distribution reference) and survival_test (actual
-    # evaluation cohort) for sksurv's IPCW methods. sksurv's convention expects these to
-    # ideally be separate samples -- reusing one set is a known source of mild optimistic
-    # bias, worse with small/rare-event samples (directly relevant given MALO's low
-    # incidence). Fine for synthetic proof-of-concept; must be revisited once real Stage 1
-    # data is available, likely using the full training split as survival_train regardless
-    # of which split is being evaluated.
     y = _structured_survival_array(event_indicator, event_or_censoring_time)
+    ref_time, ref_type = _reference_or_self(reference, event_or_censoring_time, event_indicator.astype(int))
+    y_ref = _structured_survival_array(ref_type == 1, ref_time)  # sksurv survival_train = IPCW reference
     survival_over_time = 1.0 - cif_over_time
 
     # sksurv requires every value in `times` to lie strictly within the observed follow-up
@@ -439,7 +447,7 @@ def integrated_brier_score_metric(
     else:
         col_idx = np.arange(len(time_grid))
 
-    return float(integrated_brier_score(y, y, survival_over_time[:, col_idx], safe_grid))
+    return float(integrated_brier_score(y_ref, y, survival_over_time[:, col_idx], safe_grid))
 
 
 def ipcw_calibration_curve(
@@ -484,62 +492,52 @@ def ipcw_calibration_curve(
     }
 
 
-def compute_all_metrics(predictions: dict, ground_truth: dict, horizons: list) -> pd.DataFrame:
-    """Orchestrates C-index + IBS across all 3 outcomes x all horizons for ONE model's
-    predictions.
+def compute_all_metrics(predictions: dict, ground_truth: dict, censoring_reference: dict, horizon: int) -> pd.DataFrame:
+    """C-index + IBS at `horizon` for all 3 outcomes, for ONE model's predictions.
 
-    C-index dispatch: mortality has no competing risk here -> time_dependent_cindex (Uno's
-    C), unchanged. malo and cvd have mortality as a real competing risk -> wolbers_cindex,
-    which correctly distinguishes "died before the outcome could occur" (permanently
-    precluded) from ordinary censoring (unknown fate) -- Uno's C treats them the same, which
-    biases the metric.
+    Dispatch: mortality (no competing risk) -> Uno's C (time_dependent_cindex) + sksurv IBS
+    (integrated_brier_score_metric). MALO / CVD (death competes) -> Wolbers' C
+    (wolbers_cindex) + Schoop competing-risk IBS (schoop_competing_risks_ibs).
 
-    IBS dispatch mirrors this exactly, same rationale: mortality -> integrated_brier_score_
-    metric (sksurv's IPCW Brier score), unchanged. malo/cvd -> schoop_competing_risks_ibs,
-    the Graf/Schoop competing-risks extension -- sksurv's plain IBS treats a competing event
-    (e.g. death before malo/cvd could occur) as ordinary censoring, which biases the
-    calibration estimate the same way Uno's C biases discrimination for those two outcomes.
+    predictions: {outcome: (n, T) CIF at yearly bins 1..T}, T >= horizon, rows aligned with
+      ground_truth.
+    ground_truth: {outcome: {"time_years", "event_type", "at_risk"}} from
+      compass.evaluation.pipeline.ground_truth_from_targets (i.e. from build_targets):
+      event_type 1 = event, 2 = competing death (MALO / CVD only), 0 = censored. Rows with
+      at_risk == 0 are EXCLUDED for that outcome.
+    censoring_reference: {outcome: {"time_years", "event_type"}} -- the IPCW censoring
+      reference, required; the evaluation pipeline passes the TRAINING split.
 
-    predictions: {"mortality": (n, T) CIF array, "malo": ..., "cvd": ...} at yearly bins
-    1..T, T >= max(horizons) -- see module docstring for the exact convention.
-    ground_truth: {"mortality": {"event_indicator": (n,), "time_years": (n,)}, "malo": ...,
-    "cvd": ...} -- time_years is that outcome's own event time if it occurred, else its
-    censoring time, using the SAME per-outcome censoring rule already implemented in
-    compass.training.survival_losses / batching.py (mortality censors malo/cvd; malo/cvd
-    don't censor each other), just consumed here for evaluation instead of training.
-    wolbers_cindex and schoop_competing_risks_ibs additionally need to distinguish competing
-    events from pure censoring for malo/cvd; this is derived inline from
-    ground_truth["mortality"]["event_indicator"] (mortality occurring IS the competing event
-    for malo/cvd) -- no change to the ground_truth dict shape is needed.
+    The evaluated data is truncated at `horizon` (later times -> horizon, later events ->
+    censored): both metrics only use information up to the horizon, and this keeps every
+    evaluated time inside the reference's follow-up range.
 
-    Returns a tidy DataFrame: columns [outcome, horizon, metric_name, value].
+    Returns a tidy DataFrame: [outcome, horizon, metric_name, value], metric_name in
+    {"cindex", "ibs"}; NaN when a sample has no events (e.g. a bootstrap draw).
     """
-    mortality_event = ground_truth["mortality"]["event_indicator"].astype(bool)
-
+    horizon = int(horizon)
+    time_grid = np.arange(1, horizon + 1, dtype=float)
     rows = []
     for outcome in OUTCOME_NAMES:
-        cif_all = predictions[outcome]
-        event_indicator = ground_truth[outcome]["event_indicator"]
-        time_years = ground_truth[outcome]["time_years"]
+        gt = ground_truth[outcome]
+        keep = np.asarray(gt["at_risk"]).astype(bool)
+        cif_all = np.asarray(predictions[outcome])[keep]
+        time_years = np.asarray(gt["time_years"], dtype=float)[keep]
+        event_type = np.asarray(gt["event_type"])[keep]
+        beyond = time_years > horizon
+        event_type = np.where(beyond, 0, event_type)
+        time_years = np.minimum(time_years, float(horizon))
+        reference = censoring_reference[outcome]
 
-        # 0=censored, 1=had this outcome, 2=competing event (mortality) -- only meaningful
-        # (and only used) for malo/cvd; irrelevant for mortality's own unchanged dispatch.
-        event_type = np.where(event_indicator.astype(bool), 1, np.where(mortality_event, 2, 0))
-
-        for horizon in horizons:
-            bin_idx = int(horizon) - 1
-            cif_at_horizon = cif_all[:, bin_idx]
-            time_grid = np.arange(1, horizon + 1, dtype=float)
-            cif_over_time = cif_all[:, : int(horizon)]
-
-            if outcome == "mortality":
-                cindex = time_dependent_cindex(cif_at_horizon, event_indicator, time_years, horizon)
-                ibs = integrated_brier_score_metric(cif_over_time, event_indicator, time_years, horizon, time_grid)
-            else:
-                cindex = wolbers_cindex(cif_at_horizon, event_type, time_years, horizon, cause_of_interest=1)
-                ibs = schoop_competing_risks_ibs(cif_over_time, event_type, time_years, horizon, time_grid, cause_of_interest=1)
-
-            rows.append({"outcome": outcome, "horizon": horizon, "metric_name": "cindex", "value": cindex})
-            rows.append({"outcome": outcome, "horizon": horizon, "metric_name": "ibs", "value": ibs})
-
+        cif_at_horizon = cif_all[:, horizon - 1]
+        cif_over_time = cif_all[:, :horizon]
+        if outcome == DEATH_OUTCOME:
+            event = (event_type == 1).astype(int)
+            cindex = time_dependent_cindex(cif_at_horizon, event, time_years, horizon, reference=reference)
+            ibs = integrated_brier_score_metric(cif_over_time, event, time_years, horizon, time_grid, reference=reference)
+        else:
+            cindex = wolbers_cindex(cif_at_horizon, event_type, time_years, horizon, cause_of_interest=1, reference=reference)
+            ibs = schoop_competing_risks_ibs(cif_over_time, event_type, time_years, horizon, time_grid, cause_of_interest=1, reference=reference)
+        rows.append({"outcome": outcome, "horizon": horizon, "metric_name": "cindex", "value": cindex})
+        rows.append({"outcome": outcome, "horizon": horizon, "metric_name": "ibs", "value": ibs})
     return pd.DataFrame(rows)

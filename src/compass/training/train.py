@@ -58,6 +58,7 @@ import torch
 
 from compass.data.landmarking import construct_landmark_example, death_date_of, sample_landmark
 from compass.data.preprocessing import run_preprocessing, scale_and_mask_examples
+from compass.data.splitting import data_fingerprint, save_split
 from compass.training.batching import collate_examples
 from compass.training.targets import compute_last_visit_dates
 
@@ -82,6 +83,7 @@ class Trainer:
         smoking_status_categories: list,
         horizons: list[int],
         administrative_cutoff: pd.Timestamp,
+        split: dict | None = None,
     ):
         """model: any of the three architectures, satisfying base.py's shared interface.
         model_config: from configs/model_*.yaml (per-architecture hyperparameters -- reads
@@ -94,6 +96,10 @@ class Trainer:
         smoking_status_categories, horizons, administrative_cutoff: everything else
         run_preprocessing() needs -- see module docstring for why these are required here
         too, beyond the model/model_config/training_config originally sketched.
+        split: optional pinned split {"train", "val", "test": patient IDs} (from a run's
+        split.json); None = derive it with patient_level_split from training_config's seed.
+        fit() saves the split actually used, plus a data fingerprint and the seed, to its
+        checkpoint_dir/split.json, so evaluation reuses it instead of re-deriving it.
         """
         self.model = model
         self.model_config = model_config
@@ -133,7 +139,9 @@ class Trainer:
             seed=self.seed,
             resample_each_epoch=False,
             epoch=0,
+            split=split,
         )
+        self.data_fingerprint = data_fingerprint(visits_df, outcomes_df)
         self.scalers = result.scalers
         self.feature_names = result.feature_names
 
@@ -144,6 +152,11 @@ class Trainer:
         # Fixed eval examples, keyed by patient_id, covering both val and test -- reused by
         # every evaluate(resample_landmarks=False) call across the whole training run.
         self._fixed_eval_examples = {ex["patient_id"]: ex for ex in result.val + result.test}
+        # Fixed (seed-sampled) TRAINING-split landmark examples: never used for training
+        # (training resamples landmarks every epoch) -- only as the evaluation pipeline's
+        # IPCW censoring reference (compass.evaluation.pipeline), which must come from the
+        # training split, never from the split being evaluated.
+        self._fixed_train_examples = list(result.train)
 
         # Raw per-patient data, for resampling fresh TRAINING landmarks each epoch (and for
         # evaluate(resample_landmarks=True)'s fresh draws).
@@ -157,6 +170,15 @@ class Trainer:
 
         self._resume_epoch = None
         self._resume_rng_state = None
+
+    def fixed_examples(self, split: str) -> list[dict]:
+        """The split's fixed landmark examples (scaled + masked), in split order.
+        train: the seed-sampled training landmarks (IPCW reference only, see __init__);
+        val / test: the same fixed landmarks evaluate(resample_landmarks=False) uses."""
+        if split == "train":
+            return list(self._fixed_train_examples)
+        ids = {"val": self.val_ids, "test": self.test_ids}[split]
+        return [self._fixed_eval_examples[pid] for pid in ids]
 
     def _build_scheduler(self, scheduler_config: dict | None):
         if not scheduler_config:
@@ -177,7 +199,7 @@ class Trainer:
             landmark_date = sample_landmark(
                 patient_visits, rng, index_date=patient_outcomes["index_date"], death_date=death_date_of(patient_outcomes)
             )
-            raw_examples.append(construct_landmark_example(patient_visits, patient_outcomes, landmark_date, self.horizons))
+            raw_examples.append(construct_landmark_example(patient_visits, patient_outcomes, landmark_date))
         return scale_and_mask_examples(
             raw_examples, self.scalers, self.continuous_columns, self.medication_columns,
             self.sex_categories, self.smoking_status_categories, self.feature_names,
@@ -305,10 +327,18 @@ class Trainer:
 
         If resume() was called first, continues from that checkpoint's epoch/rng state instead
         of starting fresh from training_config's seed at epoch 0.
+
+        After the loop, the model's weights are RELOADED from checkpoint_best.pt (the
+        best-validation epoch), so whatever happens next -- evaluation, saving -- uses the
+        best weights, never the last epoch's. history["best_epoch"] / ["best_val_loss"]
+        record which epoch that was.
         """
         checkpoint_dir = Path(checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         log_path = checkpoint_dir / "training_log.jsonl"
+        # Pin the split (+ data fingerprint + seed) next to the checkpoints: evaluation
+        # loads it from here instead of re-deriving it (compass.data.splitting.load_split).
+        save_split(checkpoint_dir, self.train_ids, self.val_ids, self.test_ids, self.data_fingerprint, self.seed)
 
         if self._resume_epoch is not None:
             start_epoch = self._resume_epoch + 1
@@ -351,4 +381,10 @@ class Trainer:
             if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
                 break
 
+        best_path = checkpoint_dir / "checkpoint_best.pt"
+        if best_path.exists():
+            best = torch.load(best_path, weights_only=False)
+            self.model.load_state_dict(best["model_state_dict"])
+            history["best_epoch"] = int(best["epoch"])
+            history["best_val_loss"] = float(best["val_loss"])
         return history

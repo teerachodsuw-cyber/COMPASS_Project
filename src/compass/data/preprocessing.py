@@ -139,7 +139,7 @@ class PreprocessedData:
     train/val/test are each a list of per-patient landmark examples: dicts with
     patient_id, landmark_date, input_visits (raw), input_values (scaled/encoded +
     zero-filled, columns in feature_names order), input_mask (1=observed/0=missing, same
-    column order), and outcome_labels ({outcome: {horizon: 0/1}}).
+    column order). No outcome labels: targets come from compass.training.targets.build_targets.
     """
 
     train: list[dict]
@@ -165,6 +165,7 @@ def run_preprocessing(
     seed: int = 42,
     resample_each_epoch: bool = False,
     epoch: int = 0,
+    split: dict | None = None,
 ) -> PreprocessedData:
     """Run the full pipeline once and return a PreprocessedData bundle.
 
@@ -173,8 +174,17 @@ def run_preprocessing(
     per training patient each call (variety across epochs). val/test landmarks are always
     derived from a fixed seed independent of `epoch`, so evaluation stays comparable across
     calls regardless of this flag.
+
+    split: a pinned split {"train": ids, "val": ids, "test": ids} (e.g. loaded from a run's
+    split.json at evaluation) -- used as-is instead of re-deriving it with patient_level_split.
     """
-    train_ids, val_ids, test_ids = patient_level_split(outcomes_df, train_frac, val_frac, test_frac, seed)
+    if split is not None:
+        train_ids, val_ids, test_ids = list(split["train"]), list(split["val"]), list(split["test"])
+        unknown = len(set(train_ids + val_ids + test_ids) - set(outcomes_df["patient_id"]))
+        if unknown:
+            raise ValueError(f"pinned split has {unknown} patient ID(s) not in outcomes_df")
+    else:
+        train_ids, val_ids, test_ids = patient_level_split(outcomes_df, train_frac, val_frac, test_frac, seed)
     outcomes_indexed = outcomes_df.set_index("patient_id")
     visits_by_patient = {
         pid: group.sort_values("visit_date").reset_index(drop=True) for pid, group in visits_df.groupby("patient_id")
@@ -189,7 +199,7 @@ def run_preprocessing(
             landmark_date = sample_landmark(
                 patient_visits, rng, index_date=patient_outcomes["index_date"], death_date=death_date_of(patient_outcomes)
             )
-            examples.append(construct_landmark_example(patient_visits, patient_outcomes, landmark_date, horizons))
+            examples.append(construct_landmark_example(patient_visits, patient_outcomes, landmark_date))
         return examples
 
     train_landmark_seed = seed + epoch if resample_each_epoch else seed
