@@ -237,7 +237,9 @@ class SurvLatentODEModel(CompassSurvivalModel):
         model. Converts each bin's incremental cumulative hazard (from the augmented ODE
         integral) into a discrete per-bin event probability: 1 - exp(-delta_cum_hazard),
         so hazards_to_cif()'s product-of-survival formula exactly reconstructs the true
-        continuous survival function at each bin boundary.
+        continuous survival function at each bin boundary. Returns hazards only -- the CIF
+        (single-cause for mortality, competing-risk for MALO / CVD) is computed by the
+        shared base-class path (forward() -> predict_risk() -> cif_for_outcome()).
         """
         landmark_state = self.encode_trajectory(values, mask, seq_lengths, elapsed_days)
         batch = landmark_state.shape[0]

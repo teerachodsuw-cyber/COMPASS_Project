@@ -236,3 +236,24 @@ def test_10yr_cif_reads_bins_0_to_9_only(num_bins):
     bin9_changed = hazards.clone()
     bin9_changed[:, 9] = 0.9
     assert not torch.allclose(model.hazards_to_cif(bin9_changed, [model.horizon_bin])[:, 0], cif_10)
+
+
+def test_10yr_competing_cif_reads_bins_0_to_9_only(num_bins):
+    # MALO/CVD competing-risk CIF at 10 yr (bin 9) reads the cause hazard in bins 0-9 and the
+    # death hazard in bins 0-8 only: by the same-year convention an event in year s needs
+    # survival from death through year s-1, so death in bin 9 cannot pre-empt a bin-9 event.
+    model = DynamicDeepHitModel(num_features=1, num_time_bins=num_bins, bin_width_years=BIN_WIDTH, horizon_years=HORIZON_YEARS)
+    torch.manual_seed(2)
+    hazards = {"mortality": torch.rand(4, num_bins) * 0.2, "malo": torch.rand(4, num_bins) * 0.2, "cvd": torch.rand(4, num_bins) * 0.2}
+    cif_10 = model.cif_for_outcome(hazards, "malo", [model.horizon_bin])[:, 0]
+
+    def _with(name, bins, value):
+        changed = {k: v.clone() for k, v in hazards.items()}
+        changed[name][:, bins] = value
+        return model.cif_for_outcome(changed, "malo", [model.horizon_bin])[:, 0]
+
+    for name in ("malo", "mortality"):
+        assert torch.allclose(_with(name, slice(10, None), 0.9), cif_10), name   # after bin 9: no effect
+    assert not torch.allclose(_with("malo", 9, 0.9), cif_10)                    # cause hazard, bin 9: counts
+    assert torch.allclose(_with("mortality", 9, 0.9), cif_10)                   # death hazard, bin 9: no effect
+    assert not torch.allclose(_with("mortality", 8, 0.9), cif_10)               # death hazard, bin 8: counts

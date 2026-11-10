@@ -23,6 +23,7 @@ import torch
 from torch import nn
 
 OUTCOME_NAMES = ("mortality", "malo", "cvd")
+DEATH_OUTCOME = "mortality"  # the terminal event: the competing risk for MALO and CVD
 
 
 def years_to_bin_index(years: torch.Tensor, bin_width_years: float, num_time_bins: int) -> torch.Tensor:
@@ -60,9 +61,12 @@ class CompassSurvivalModel(nn.Module, ABC):
 
     Concrete (non-abstract, shared) helpers:
     - hazards_to_cif(): discrete-time hazard -> cumulative incidence, identical formula
-      regardless of architecture.
+      regardless of architecture. Mortality: single-cause CIF. MALO / CVD: competing-risk
+      CIF with death as the competing event (pass death_hazards).
+    - cif_for_outcome(): picks the right hazards_to_cif() call for an outcome name -- the
+      entry point every prediction path uses.
     - predict_risk(): the method evaluation/comparison code actually calls -- wraps
-      forward() + hazards_to_cif() into (batch, 3, len(horizons)) CIF probabilities.
+      forward() + cif_for_outcome() into (batch, 3, len(horizons)) CIF probabilities.
     - years_to_bin_index(): default yearly-bin mapping from requested horizon (years) to
       this model's internal bin index; subclasses set self.bin_width_years/num_time_bins in
       __init__, or override this method directly for a non-default/non-discrete scheme.
@@ -83,20 +87,49 @@ class CompassSurvivalModel(nn.Module, ABC):
         raise NotImplementedError
 
     @staticmethod
-    def hazards_to_cif(hazards: torch.Tensor, horizon_bins: list[int]) -> torch.Tensor:
-        """Convert a discrete-time hazard sequence (batch, num_time_bins) into cumulative
-        incidence at each requested (0-indexed, inclusive) bin index, via the standard
-        product-of-survival formula:
-            survival(t) = prod_{k=0..t} (1 - hazard_k)
-            CIF(t) = 1 - survival(t)
-        Returns (batch, len(horizon_bins)).
+    def hazards_to_cif(
+        hazards: torch.Tensor, horizon_bins: list[int], death_hazards: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Discrete-time hazards (batch, num_time_bins) -> cumulative incidence at each
+        requested (0-indexed, inclusive) bin j. Returns (batch, len(horizon_bins)).
+
+        death_hazards=None -- single-cause CIF (mortality):
+            CIF(t_j) = 1 - prod_{s<=j} (1 - h(s))
+
+        death_hazards given -- competing-risk CIF for a non-fatal cause k (MALO or CVD),
+        death as the only competing event:
+            CIF_k(t_j) = sum_{s<=j} h_k(s) * prod_{u<s} (1 - h_k(u)) * (1 - h_death(u))
+        MALO and CVD never enter each other's survival term: they can co-occur, so having
+        one does not remove a patient from the other's risk set (only death does).
+
+        Same-year convention: an event of cause k in year s requires survival from BOTH
+        cause k and death through year s-1 (the product runs over u < s). Within year s the
+        cause-k hazard h_k(s) is applied to everyone alive and event-free at its start --
+        a death later in that same year does not pre-empt it. This matches the training-loss
+        convention, where a competing death is censored at the end of its bin (still at risk
+        for cause k through that bin).
+
+        With h_death = 0 the competing-risk formula reduces exactly to the single-cause one.
         """
-        survival_per_bin = 1.0 - hazards
-        cumulative_survival = torch.cumprod(survival_per_bin, dim=1)
-        cif_all_bins = 1.0 - cumulative_survival
+        if death_hazards is None:
+            cif_all_bins = 1.0 - torch.cumprod(1.0 - hazards, dim=1)
+        else:
+            survival_both = torch.cumprod((1.0 - hazards) * (1.0 - death_hazards), dim=1)
+            survival_before = torch.cat([torch.ones_like(survival_both[:, :1]), survival_both[:, :-1]], dim=1)
+            cif_all_bins = torch.cumsum(hazards * survival_before, dim=1)
 
         horizon_idx = torch.tensor(horizon_bins, dtype=torch.long, device=hazards.device)
         return cif_all_bins.index_select(dim=1, index=horizon_idx)
+
+    @classmethod
+    def cif_for_outcome(
+        cls, hazards_by_outcome: dict[str, torch.Tensor], outcome: str, horizon_bins: list[int]
+    ) -> torch.Tensor:
+        """CIF for one outcome from the model's {outcome: hazards} dict: single-cause for
+        mortality, competing-risk (death as competing event) for MALO and CVD. Every
+        prediction path goes through here (predict_risk, the Dynamic-DeepHit ranking score)."""
+        death = None if outcome == DEATH_OUTCOME else hazards_by_outcome[DEATH_OUTCOME]
+        return cls.hazards_to_cif(hazards_by_outcome[outcome], horizon_bins, death_hazards=death)
 
     def years_to_bin_index(self, horizon_years: int) -> int:
         return int(years_to_bin_index(torch.tensor(float(horizon_years)), self.bin_width_years, self.num_time_bins).item())
@@ -109,12 +142,13 @@ class CompassSurvivalModel(nn.Module, ABC):
         horizons: list[int],
         elapsed_days: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """forward() + hazards_to_cif() for each outcome, stacked into
+        """forward() + cif_for_outcome() for each outcome, stacked into
         (batch, 3, len(horizons)) -- the method evaluation/comparison code actually calls.
+        Mortality: single-cause CIF; MALO / CVD: competing-risk CIF (death competing).
         """
         hazards_by_outcome = self.forward(values, mask, seq_lengths, elapsed_days)
         horizon_bins = [self.years_to_bin_index(h) for h in horizons]
-        cifs = [self.hazards_to_cif(hazards_by_outcome[name], horizon_bins) for name in OUTCOME_NAMES]
+        cifs = [self.cif_for_outcome(hazards_by_outcome, name, horizon_bins) for name in OUTCOME_NAMES]
         return torch.stack(cifs, dim=1)
 
 
