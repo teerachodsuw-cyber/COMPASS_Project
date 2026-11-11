@@ -1,0 +1,17 @@
+# Hyperparameter grid for scripts/tune.py (per model).
+# learning_rate = the model config's learning_rate x each multiplier; weight_decay = each value.
+# 3 x 3 = 9 configs per model, 27 in all. Every config uses the same pinned split, seed and
+# max_epochs / early_stopping_patience (configs/training.yaml: training_loop).
+grid:
+  learning_rate_multipliers: [1.0, 0.3, 0.1]
+  weight_decay: [0.0, 1.0e-4, 1.0e-3]
+
+models: [dynamic_deephit, tracer, survlatent_ode]
+run_dir: runs/tune_v1       # <run_dir>/<model>/<config_id>/  (git-ignored)
+out_dir: outputs/tune_v1    # summary.csv + summary.md         (git-ignored)
+
+# Used only by --dry-run to estimate run time: measured on the real data in the v1 full run
+# (runs/full_v1; seconds per epoch incl. validation, and epochs run before early stopping).
+v1_reference:
+  seconds_per_epoch: {dynamic_deephit: 9.2, tracer: 25.6, survlatent_ode: 37.9}
+  epochs_run: {dynamic_deephit: 46, tracer: 48, survlatent_ode: 29}

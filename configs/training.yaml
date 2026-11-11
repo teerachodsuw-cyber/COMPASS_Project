@@ -16,6 +16,10 @@ splitting:
 landmarking:
   sampling: "one_random_landmark_per_subject_per_epoch"  # training only
 
+training_loop:
+  max_epochs: 100              # scripts/train.py --epochs overrides (v1 full run: 100)
+  early_stopping_patience: 10  # epochs without val total-loss improvement; null = no early stopping
+
 evaluation:
   # Landmark for val / test (and the training-split IPCW reference):
   #   first_post_index (default) = each patient's FIRST visit on/after index_date and before death

@@ -87,7 +87,8 @@ class Trainer:
     ):
         """model: any of the three architectures, satisfying base.py's shared interface.
         model_config: from configs/model_*.yaml (per-architecture hyperparameters -- reads
-        learning_rate, batch_size, num_time_bins, bin_width_years; optional "scheduler" dict
+        learning_rate, weight_decay (AdamW, default 0), batch_size, num_time_bins,
+        bin_width_years; optional "scheduler" dict
         for an LR scheduler, e.g. {"type": "StepLR", "step_size": 10, "gamma": 0.5} --
         none of the current configs set one, so the default is no scheduler).
         training_config: from configs/training.yaml (reads seed, splitting.train_frac/
@@ -117,7 +118,12 @@ class Trainer:
         self.sex_categories = tuple(sex_categories)
         self.smoking_status_categories = list(smoking_status_categories)
 
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=float(model_config["learning_rate"]))
+        # AdamW for all three models. With weight_decay = 0 it is exactly the previous plain Adam.
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(model_config["learning_rate"]),
+            weight_decay=float(model_config.get("weight_decay", 0.0)),
+        )
         self.scheduler = self._build_scheduler(model_config.get("scheduler"))
 
         # ONE run_preprocessing call: fits scalers, builds the FIXED val/test landmark

@@ -2,8 +2,8 @@
 """Thin CLI entry point for compass.training.train.Trainer.
 
 Usage:
-    python scripts/train.py --model dynamic_deephit --epochs 15 --checkpoint-dir runs/ddh
-    python scripts/train.py --model all --epochs 15 --checkpoint-dir runs/
+    python scripts/train.py --model all --checkpoint-dir runs/       # epochs / patience from configs/training.yaml
+    python scripts/train.py --model dynamic_deephit --epochs 15 --checkpoint-dir runs/ddh   # CLI overrides config
 
 --model all trains all three architectures SEQUENTIALLY (not parallelized in this pass) on
 the SAME train/val/test patient split. This is not something this script has to work hard to
@@ -82,14 +82,27 @@ def train_one_model(name: str, args, visits_df, outcomes_df, schema, training_co
     return {"history": history, "split": {"train": trainer.train_ids, "val": trainer.val_ids, "test": trainer.test_ids}}
 
 
+def resolve_epochs_and_patience(args, training_config: dict) -> tuple[int, int | None]:
+    """CLI flags override; otherwise configs/training.yaml training_loop.{max_epochs,
+    early_stopping_patience}."""
+    loop = training_config.get("training_loop", {})
+    epochs = args.epochs if args.epochs is not None else loop.get("max_epochs")
+    if epochs is None:
+        raise SystemExit("no max epochs: pass --epochs or set training_loop.max_epochs in configs/training.yaml")
+    patience = args.early_stopping_patience if args.early_stopping_patience is not None else loop.get("early_stopping_patience")
+    return int(epochs), (int(patience) if patience is not None else None)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=[*MODEL_REGISTRY.keys(), "all"], required=True)
-    parser.add_argument("--epochs", type=int, required=True)
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Max epochs; default configs/training.yaml training_loop.max_epochs.")
     parser.add_argument("--checkpoint-dir", type=str, required=True)
     parser.add_argument("--n-patients", type=int, default=1000)
     parser.add_argument("--data-seed", type=int, default=None, help="Defaults to configs/training.yaml's seed if unset.")
-    parser.add_argument("--early-stopping-patience", type=int, default=None)
+    parser.add_argument("--early-stopping-patience", type=int, default=None,
+                        help="Default configs/training.yaml training_loop.early_stopping_patience.")
     parser.add_argument("--checkpoint-every-n-epochs", type=int, default=1)
     parser.add_argument("--data", type=str, default=None,
                         help="Processed real-data dir (from scripts/build_cohort.py). Omit for synthetic data.")
@@ -99,6 +112,8 @@ def main():
         schema = yaml.safe_load(f)
     with open("configs/training.yaml") as f:
         training_config = yaml.safe_load(f)
+    args.epochs, args.early_stopping_patience = resolve_epochs_and_patience(args, training_config)
+    print(f"max epochs {args.epochs}, early-stopping patience {args.early_stopping_patience}")
 
     if args.data:
         visits_df = pd.read_parquet(f"{args.data}/cohort_visits.parquet")
