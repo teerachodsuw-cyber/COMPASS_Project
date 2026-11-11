@@ -18,9 +18,9 @@ num_time_bins: 13       # Bins cover all observable follow-up; the evaluation ho
 bin_width_years: 1.0    # placeholder
 
 # Time-decay missingness gate (TRACER's native mechanism, replaces mask+zero-fill):
-# weight = exp(-time_since_last_observed_days / tau), tau learnable per feature.
-max_staleness_days: 3650.0  # placeholder (~10yr), cap for "never observed" sentinel
+# weight = exp(-time_since_last_observed_years / tau), tau learnable per feature (years).
+max_staleness_years: 10.0   # placeholder, cap / "never observed" sentinel for time since last observed
+tau_init_years: 0.5         # initial tau (per feature), on the scale of visit gaps
 
 # No ranking_weight / auxiliary_weight here -- unlike Dynamic-DeepHit, TRACER's loss is
-# just the sum of three independent per-outcome discrete-time NLLs (inverse-frequency
-# weighted). Nothing else.
+# just the sum of three independent per-outcome discrete-time NLLs, unweighted. Nothing else.

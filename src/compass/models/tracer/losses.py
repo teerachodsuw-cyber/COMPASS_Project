@@ -1,8 +1,9 @@
-"""TRACER loss: sum of three independent per-outcome discrete-time hazard NLLs, inverse-
-frequency weighted. Unlike Dynamic-DeepHit, TRACER has NO ranking loss and NO auxiliary
-next-visit prediction loss -- just direct discrete-time hazard negative log-likelihood per
-outcome, using the same per-outcome targets (compass.training.targets.build_targets), each
-averaged over that outcome's at-risk examples only.
+"""TRACER loss: unweighted sum of three independent per-outcome discrete-time hazard NLLs
+(no class-imbalance weighting -- dropped 2026-11-11). Unlike Dynamic-DeepHit, TRACER has NO
+ranking loss and NO auxiliary next-visit prediction loss -- just direct discrete-time hazard
+negative log-likelihood per outcome, using the same per-outcome targets
+(compass.training.targets.build_targets), each averaged over that outcome's at-risk examples
+only.
 """
 
 import torch
@@ -14,7 +15,6 @@ from compass.training.survival_losses import discrete_time_survival_nll
 def tracer_survival_loss(
     hazards: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
-    outcome_weights: dict[str, float],
 ) -> dict[str, torch.Tensor]:
     """hazards: {"mortality": ..., "malo": ..., "cvd": ...}, each (batch, num_time_bins).
     batch must contain {name}_event_indicator / {name}_event_bin / {name}_censoring_bin /
@@ -22,8 +22,7 @@ def tracer_survival_loss(
     DeepHit uses, so the two architectures are compared on identical censoring semantics).
 
     Returns {"survival_nll": total, "total": total} -- total loss IS the survival NLL, sum
-    of the three outcomes' independent, inverse-frequency-weighted contributions. Nothing
-    else is added.
+    of the three outcomes' independent contributions, unweighted. Nothing else is added.
     """
     nll_terms = {
         name: discrete_time_survival_nll(
@@ -35,5 +34,5 @@ def tracer_survival_loss(
         )
         for name in OUTCOME_NAMES
     }
-    total = sum(outcome_weights[name] * nll_terms[name] for name in OUTCOME_NAMES)
+    total = sum(nll_terms[name] for name in OUTCOME_NAMES)  # unweighted sum (no class-imbalance weighting)
     return {"survival_nll": total, "total": total}

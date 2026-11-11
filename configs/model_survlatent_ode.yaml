@@ -23,5 +23,4 @@ num_time_bins: 13       # Bins cover all observable follow-up; the evaluation ho
 bin_width_years: 1.0    # placeholder
 
 # No ranking_weight / auxiliary_weight -- like TraCeR, SurvLatent ODE's loss is just the sum
-# of three independent per-outcome continuous-time NLLs (inverse-frequency weighted).
-# Nothing else.
+# of three independent per-outcome continuous-time NLLs, unweighted. Nothing else.

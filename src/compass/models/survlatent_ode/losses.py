@@ -64,15 +64,14 @@ def survlatent_ode_survival_loss(
     model,
     landmark_state: torch.Tensor,
     batch: dict[str, torch.Tensor],
-    outcome_weights: dict[str, float],
 ) -> dict[str, torch.Tensor]:
     """batch must contain, per outcome, {name}_event_indicator, {name}_target_days and
     {name}_at_risk (see
     compass.training.batching.collate_examples).
 
     Returns {"survival_nll": total, "total": total} -- total IS the survival NLL, sum of
-    the three outcomes' independent, inverse-frequency-weighted contributions. Nothing else
-    is added, same as TraCeR.
+    the three outcomes' independent contributions, unweighted. Nothing else is added, same
+    as TraCeR.
     """
     nll_terms = {
         name: _outcome_nll(
@@ -85,5 +84,5 @@ def survlatent_ode_survival_loss(
         )
         for name in OUTCOME_NAMES
     }
-    total = sum(outcome_weights[name] * nll_terms[name] for name in OUTCOME_NAMES)
+    total = sum(nll_terms[name] for name in OUTCOME_NAMES)  # unweighted sum (no class-imbalance weighting)
     return {"survival_nll": total, "total": total}

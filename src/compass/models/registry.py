@@ -38,6 +38,8 @@ def build_model(name: str, model_config: dict, num_features: int, horizon_years:
             cause_head_hidden_dim=model_config["cause_head_hidden_dim"],
             num_time_bins=model_config["num_time_bins"],
             bin_width_years=model_config["bin_width_years"],
+            max_staleness_years=model_config["max_staleness_years"],
+            tau_init_years=model_config["tau_init_years"],
         )
     if name == "survlatent_ode":
         return model_cls(

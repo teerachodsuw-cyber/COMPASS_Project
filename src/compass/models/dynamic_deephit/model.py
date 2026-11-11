@@ -31,16 +31,9 @@ class DynamicDeepHitModel(CompassSurvivalModel):
         bin_width_years: float = 1.0,
         ranking_weight: float = 0.1,
         auxiliary_weight: float = 0.1,
-        outcome_weights: dict[str, float] | None = None,
         horizon_years: float = 10.0,
     ):
-        """outcome_weights: optional per-outcome multiplier on the survival log-likelihood
-        term (inverse-frequency weighting, per configs/training.yaml's locked
-        class_imbalance_handling method). Callers should compute these from the TRAINING
-        split's actual outcome rates -- this class stays agnostic to how they're derived.
-        Defaults to equal weight (1.0) per outcome.
-
-        horizon_years: the reporting horizon (configs/training.yaml: horizons.primary). The
+        """horizon_years: the reporting horizon (configs/training.yaml: horizons.primary). The
         ranking loss scores patients by their CIF at this horizon's bin. Must lie within the
         binned window (num_time_bins * bin_width_years).
         """
@@ -57,7 +50,6 @@ class DynamicDeepHitModel(CompassSurvivalModel):
         self.horizon_bin = self.years_to_bin_index(horizon_years)
         self.ranking_weight = ranking_weight
         self.auxiliary_weight = auxiliary_weight
-        self.outcome_weights = outcome_weights or {name: 1.0 for name in OUTCOME_NAMES}
 
         # values + mask concatenated along the feature dim, so the model sees what's
         # missing, not just zero-filled values.
@@ -144,7 +136,7 @@ class DynamicDeepHitModel(CompassSurvivalModel):
             risk_score = self.cif_for_outcome(hazards, name, [self.horizon_bin])[:, 0]
             rank_terms[name] = ranking_loss(risk_score, event_indicator, observed_bin, at_risk=at_risk)
 
-        survival_nll = sum(self.outcome_weights[name] * nll_terms[name] for name in OUTCOME_NAMES)
+        survival_nll = sum(nll_terms[name] for name in OUTCOME_NAMES)  # unweighted (no class-imbalance weighting)
         total_ranking = sum(rank_terms.values())
 
         predicted_next = self.auxiliary_head(gru_out)

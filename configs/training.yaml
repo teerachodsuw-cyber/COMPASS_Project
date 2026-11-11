@@ -16,7 +16,7 @@ splitting:
 landmarking:
   sampling: "one_random_landmark_per_subject_per_epoch"
 
-loss:
-  class_imbalance_handling: "inverse_frequency_weighting"
+# Class-imbalance outcome weighting: dropped (decision 2026-11-11). All three models sum the
+# per-outcome survival losses unweighted.
 
 seed: 42  # deterministic seed — fixed from day one, unlike the prior project

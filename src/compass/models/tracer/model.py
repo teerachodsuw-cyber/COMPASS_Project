@@ -10,7 +10,8 @@ backbone":
    complete systems rather than standardizing away real architectural differences.
    Dynamic-DeepHit uses mask+zero-fill (concat value and binary mask). TRACER instead uses a
    continuous time-decay gate: weight = exp(-time_since_last_observed / tau), tau a
-   learnable per-feature decay rate. time_since_last_observed is derived here, per feature,
+   learnable per-feature decay time constant in YEARS (initialised at ~0.5 yr, the scale of
+   visit gaps). time_since_last_observed is derived here, in years, per feature,
    per timestep, from the mask sequence + elapsed_days (see compute_decay_gate()) --
    elapsed_days itself comes from compass.training.batching.collate_examples (shared,
    derived from real visit dates), but the per-FEATURE staleness tracking is TRACER-specific
@@ -25,12 +26,17 @@ backbone":
    correction needed here, unlike Dynamic-DeepHit).
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from compass.models.base import OUTCOME_NAMES, CompassSurvivalModel
 from compass.models.tracer.losses import tracer_survival_loss
+
+DAYS_PER_YEAR = 365.25
+TAU_EPS = 1e-3  # tau = softplus(raw) + TAU_EPS, in years
 
 
 class TracerModel(CompassSurvivalModel):
@@ -46,23 +52,24 @@ class TracerModel(CompassSurvivalModel):
         dropout: float = 0.1,
         num_time_bins: int = 13,
         bin_width_years: float = 1.0,
-        max_staleness_days: float = 3650.0,
-        outcome_weights: dict[str, float] | None = None,
+        max_staleness_years: float = 10.0,
+        tau_init_years: float = 0.5,
     ):
-        """outcome_weights: optional per-outcome multiplier on the survival log-likelihood
-        (inverse-frequency weighting, same convention as DynamicDeepHitModel -- see
-        configs/training.yaml's locked class_imbalance_handling method). Defaults to equal
-        weight (1.0) per outcome.
+        """max_staleness_years: cap / "never observed" sentinel for time since a feature was
+        last observed. tau_init_years: initial decay time constant (per feature, learnable).
         """
         super().__init__()
         self.num_features = num_features
         self.num_time_bins = num_time_bins
         self.bin_width_years = bin_width_years
-        self.max_staleness_days = max_staleness_days
-        self.outcome_weights = outcome_weights or {name: 1.0 for name in OUTCOME_NAMES}
+        self.max_staleness_years = max_staleness_years
 
-        # Learnable per-feature decay rate (softplus-parameterized to stay positive).
-        self.decay_rate_raw = nn.Parameter(torch.zeros(num_features))
+        # Learnable per-feature decay time constant tau (years), softplus-parameterised to stay
+        # positive: tau = softplus(raw) + TAU_EPS. raw is initialised so tau == tau_init_years
+        # (~0.5 yr), on the scale of real visit gaps -- so gates for 1-12 month gaps start in
+        # a non-saturated range and the parameter gets a useful gradient.
+        raw_init = math.log(math.expm1(tau_init_years - TAU_EPS))  # inverse softplus
+        self.decay_rate_raw = nn.Parameter(torch.full((num_features,), raw_init))
 
         # [gated_value, gate_weight] per feature per timestep -> per-feature embedding.
         self.feature_embed = nn.Linear(2, feature_embed_dim)
@@ -95,20 +102,20 @@ class TracerModel(CompassSurvivalModel):
         )
 
     def _compute_time_since_last_observed(self, mask: torch.Tensor, elapsed_days: torch.Tensor) -> torch.Tensor:
-        """(batch, seq_len, num_features) days since each feature was last actually
-        observed. mask==1 timesteps get 0. A feature not yet observed by timestep t
-        (including t=0 with mask=0) accumulates from a "never observed" sentinel
-        (max_staleness_days), capped there for numerical stability -- exp(-large/tau)
-        underflows safely to ~0 rather than over/underflowing.
+        """(batch, seq_len, num_features) YEARS since each feature was last actually
+        observed (elapsed_days arrives in days from batching and is converted here). mask==1
+        timesteps get 0. A feature not yet observed by timestep t (including t=0 with
+        mask=0) accumulates from a "never observed" sentinel (max_staleness_years), capped
+        there for numerical stability -- exp(-large/tau) underflows safely to ~0.
         """
         batch, seq_len, num_features = mask.shape
         time_since = torch.zeros(batch, seq_len, num_features, device=mask.device)
-        running = torch.full((batch, num_features), self.max_staleness_days, device=mask.device)
+        running = torch.full((batch, num_features), self.max_staleness_years, device=mask.device)
         for t in range(seq_len):
-            gap = elapsed_days[:, t].unsqueeze(-1)  # (batch, 1); 0 for each patient's first visit
+            gap = (elapsed_days[:, t] / DAYS_PER_YEAR).unsqueeze(-1)  # (batch, 1) years; 0 at the first visit
             observed_now = mask[:, t, :].bool()
             running = torch.where(observed_now, torch.zeros_like(running), running + gap)
-            running = running.clamp(max=self.max_staleness_days)
+            running = running.clamp(max=self.max_staleness_years)
             time_since[:, t, :] = running
         return time_since
 
@@ -116,9 +123,12 @@ class TracerModel(CompassSurvivalModel):
         """(batch, seq_len, num_features) continuous decay weight in (0, 1] -- TRACER's
         native missingness signal, replacing Dynamic-DeepHit's binary mask+zero-fill.
         """
-        time_since = self._compute_time_since_last_observed(mask, elapsed_days)
-        tau = F.softplus(self.decay_rate_raw) + 1e-3  # (num_features,), always positive
-        return torch.exp(-time_since / tau)
+        time_since = self._compute_time_since_last_observed(mask, elapsed_days)  # years
+        return torch.exp(-time_since / self.decay_tau_years())
+
+    def decay_tau_years(self) -> torch.Tensor:
+        """(num_features,) decay time constant tau in years, always positive."""
+        return F.softplus(self.decay_rate_raw) + TAU_EPS
 
     def _covariate_attention(self, feature_embed: torch.Tensor) -> torch.Tensor:
         """Self-attention across features, independently per (batch, timestep).
@@ -174,4 +184,4 @@ class TracerModel(CompassSurvivalModel):
         elapsed_days = batch["elapsed_days"]
         context, _ = self._encode(values, mask, seq_lengths, elapsed_days)
         hazards = {name: torch.sigmoid(head(context)) for name, head in self.cause_heads.items()}
-        return tracer_survival_loss(hazards, batch, self.outcome_weights)
+        return tracer_survival_loss(hazards, batch)

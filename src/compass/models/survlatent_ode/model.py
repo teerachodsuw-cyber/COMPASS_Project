@@ -50,19 +50,13 @@ class SurvLatentODEModel(CompassSurvivalModel):
         num_time_bins: int = 13,
         bin_width_years: float = 1.0,
         solver_method: str = "dopri5",
-        outcome_weights: dict[str, float] | None = None,
     ):
-        """outcome_weights: optional per-outcome multiplier on the survival log-likelihood
-        (inverse-frequency weighting, same convention as the other two models). Defaults to
-        equal weight (1.0) per outcome.
-        """
         super().__init__()
         self.num_features = num_features
         self.latent_dim = latent_dim
         self.num_time_bins = num_time_bins
         self.bin_width_years = bin_width_years
         self.solver_method = solver_method
-        self.outcome_weights = outcome_weights or {name: 1.0 for name in OUTCOME_NAMES}
 
         # dh/dt = f(h) -- autonomous latent dynamics. Final tanh bounds the (unscaled, per-
         # tau) derivative to [-1,1] elementwise: an unconstrained MLP vector field has no
@@ -290,4 +284,4 @@ class SurvLatentODEModel(CompassSurvivalModel):
             batch["elapsed_days"],
         )
         landmark_state = self.encode_trajectory(values, mask, seq_lengths, elapsed_days)
-        return survlatent_ode_survival_loss(self, landmark_state, batch, self.outcome_weights)
+        return survlatent_ode_survival_loss(self, landmark_state, batch)

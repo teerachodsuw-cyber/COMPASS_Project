@@ -232,7 +232,7 @@ def test_no_ranking_loss_term():
         batch[f"{name}_event_bin"] = torch.tensor([3, 3])
         batch[f"{name}_censoring_bin"] = torch.tensor([5, 5])
         batch[f"{name}_at_risk"] = torch.tensor([1.0, 1.0])
-    loss_dict = tracer_survival_loss(hazards, batch, {name: 1.0 for name in OUTCOME_NAMES})
+    loss_dict = tracer_survival_loss(hazards, batch)
 
     assert set(loss_dict.keys()) == {"survival_nll", "total"}
     assert torch.allclose(loss_dict["survival_nll"], loss_dict["total"])
@@ -274,3 +274,69 @@ def test_single_forward_backward_all_params_get_gradients(real_pipeline_batch):
 
     missing_grad = [n for n, p in model.named_parameters() if p.grad is None or p.grad.abs().sum().item() == 0]
     assert not missing_grad, f"parameters with no/zero gradient: {missing_grad}"
+
+
+# ---- time-decay gate on the scale of visit gaps (tau in years, init ~0.5 yr) -------------
+
+GAPS_DAYS = (30.0, 90.0, 180.0, 365.0)
+
+
+def _stale_gate(model, gap_days: float) -> torch.Tensor:
+    """Gate for every feature at a visit `gap_days` after the visit it was last observed."""
+    f = model.num_features
+    mask = torch.tensor([[[1.0] * f, [0.0] * f]])            # observed at visit 0, missing at visit 1
+    elapsed = torch.tensor([[0.0, gap_days]])
+    return model.compute_decay_gate(mask, elapsed)[0, 1]      # (num_features,)
+
+
+def test_tau_initialised_at_half_a_year():
+    model = _small_model(num_features=4)
+    assert torch.allclose(model.decay_tau_years(), torch.full((4,), 0.5), atol=1e-6)
+
+
+@pytest.mark.parametrize("gap_days", GAPS_DAYS)
+def test_gate_at_init_is_not_saturated_for_realistic_gaps(gap_days):
+    model = _small_model(num_features=4)
+    with torch.no_grad():
+        gate = _stale_gate(model, gap_days)
+    assert ((gate > 0.1) & (gate < 0.99)).all(), (gap_days, gate)
+    expected = np.exp(-(gap_days / 365.25) / 0.5)
+    assert torch.allclose(gate, torch.full_like(gate, expected), atol=1e-5)
+
+
+def test_gate_gradient_wrt_decay_parameter_is_nonzero(real_pipeline_batch):
+    batch, num_features = real_pipeline_batch
+    torch.manual_seed(0)
+    model = TracerModel(num_features=num_features, feature_embed_dim=8, covariate_attention_heads=2, hidden_dim=16,
+                        temporal_attention_heads=2, num_transformer_layers=1, cause_head_hidden_dim=8, num_time_bins=30)
+    model.compute_loss(batch)["total"].backward()
+    grad = model.decay_rate_raw.grad
+    assert grad is not None and torch.isfinite(grad).all()
+    assert grad.abs().sum() > 0
+
+    # A feature's tau gets a gradient exactly where that feature is stale (0 < time since
+    # last observed < cap) at a real (non-padding) visit; always-observed features (gate == 1,
+    # e.g. medication flags, sex) correctly get none.
+    with torch.no_grad():
+        time_since = model._compute_time_since_last_observed(batch["mask"], batch["elapsed_days"])
+    valid = (torch.arange(time_since.shape[1]).unsqueeze(0) < batch["seq_lengths"].unsqueeze(1)).unsqueeze(-1)
+    stale = ((time_since > 0) & (time_since < model.max_staleness_years) & valid).any(dim=(0, 1))
+    assert stale.any()
+    assert (grad[stale].abs() > 0).all()
+    assert (grad[~stale] == 0).all()
+
+
+def test_tau_changes_after_a_few_optimiser_steps(real_pipeline_batch):
+    batch, num_features = real_pipeline_batch
+    torch.manual_seed(0)
+    model = TracerModel(num_features=num_features, feature_embed_dim=8, covariate_attention_heads=2, hidden_dim=16,
+                        temporal_attention_heads=2, num_transformer_layers=1, cause_head_hidden_dim=8, num_time_bins=30)
+    tau_before = model.decay_tau_years().detach().clone()
+    optimiser = torch.optim.Adam(model.parameters(), lr=1e-2)
+    for _ in range(5):
+        optimiser.zero_grad()
+        model.compute_loss(batch)["total"].backward()
+        optimiser.step()
+    tau_after = model.decay_tau_years().detach()
+    assert not torch.allclose(tau_after, tau_before)
+    assert (tau_after > 0).all()
