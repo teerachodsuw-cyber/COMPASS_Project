@@ -1,10 +1,15 @@
 """Hyperparameter grid tuning (learning rate x weight decay) on the VALIDATION split only.
 
 Used by scripts/tune.py. For every model and grid config: same pinned split, same seed, same
-max_epochs / early_stopping_patience; train with early stopping into
-<run_dir>/<model>/<config_id>/, then record best epoch, epochs run, time, best total val loss,
-per-outcome val loss at the best epoch, and the val C-index per outcome (point estimate, no
-bootstrap). Each finished config writes result.json; re-running skips finished configs.
+max_epochs / early_stopping_patience / checkpoint_selection; train with early stopping into
+<run_dir>/<model>/<config_id>/, then record epochs run, time, each outcome's best epoch and
+best val NLL (and their sum), the best-total epoch and loss, and the val C-index per outcome
+(point estimate, no bootstrap; from each outcome's own checkpoint under per-outcome
+selection, exactly as scripts/evaluate.py). Each finished config writes result.json;
+re-running skips finished configs.
+
+Winner per model = the lowest SUM of the three per-outcome best val NLLs (best_val_nll_sum)
+-- never the total loss, which for Dynamic-DeepHit also contains ranking / auxiliary terms.
 
 The test split is never loaded: Trainers are built with the pinned split's test list EMPTY, so
 no test patient is landmarked, scaled, predicted or scored. The full pinned split (incl. test
@@ -27,12 +32,14 @@ from compass.evaluation import pipeline
 from compass.evaluation.metrics import compute_all_metrics
 from compass.models.base import OUTCOME_NAMES
 from compass.models.registry import MODEL_REGISTRY, build_model
-from compass.training.train import Trainer
+from compass.training.train import Trainer, load_selected_models
 
 RESULT_FILE = "result.json"
 SUMMARY_COLUMNS = (
-    ["model", "config_id", "learning_rate", "weight_decay", "best_epoch", "epochs_run", "seconds", "best_val_total"]
-    + [f"val_nll_{o}" for o in OUTCOME_NAMES]
+    ["model", "config_id", "learning_rate", "weight_decay", "checkpoint_selection", "epochs_run", "seconds"]
+    + [f"best_epoch_{o}" for o in OUTCOME_NAMES]
+    + [f"best_val_nll_{o}" for o in OUTCOME_NAMES]
+    + ["best_val_nll_sum", "best_epoch", "best_val_total"]
     + [f"val_cindex_{o}" for o in OUTCOME_NAMES]
     + ["winner"]
 )
@@ -111,10 +118,11 @@ def make_trainer(entry: dict, visits_df, outcomes_df, schema: dict, training_cfg
 
 def val_cindex(trainer, model, horizon: int) -> dict[str, float]:
     """Val C-index per outcome at the horizon, point estimate (no bootstrap); IPCW reference =
-    the training split, same pipeline as scripts/evaluate.py."""
+    the training split, same pipeline as scripts/evaluate.py. model: one model, or
+    {outcome: model} for per-outcome checkpoints."""
     _, gt = pipeline.split_ground_truth(trainer, "val")
     reference = pipeline.censoring_reference_from_train(trainer)
-    preds = pipeline.predict_cifs(model, trainer, "val", horizon)
+    preds = pipeline.predict_selected_cifs(model, trainer, "val", horizon)
     df = compute_all_metrics(preds, gt, reference, horizon)
     return {r.outcome: float(r.value) for r in df.itertuples() if r.metric_name == "cindex"}
 
@@ -131,16 +139,19 @@ def train_and_score(entry: dict, visits_df, outcomes_df, schema: dict, training_
     history = trainer.fit(trainer.train_ids, trainer.val_ids, num_epochs=max_epochs, checkpoint_dir=str(out),
                           early_stopping_patience=patience)
     seconds = time.monotonic() - t0
-    best = int(history["best_epoch"])
-    best_val = history["val"][best]  # fresh run (no resume): history index == epoch
+    best_nll = {o: float(history["best_val_nll_per_outcome"][o]) for o in OUTCOME_NAMES}
+    selected = load_selected_models(model, out)  # what evaluation would use
     result = {
         **entry,
-        "best_epoch": best,
+        "checkpoint_selection": history["checkpoint_selection"],
         "epochs_run": len(history["train"]),
         "seconds": round(seconds, 1),
+        **{f"best_epoch_{o}": int(history["best_epoch_per_outcome"][o]) for o in OUTCOME_NAMES},
+        **{f"best_val_nll_{o}": best_nll[o] for o in OUTCOME_NAMES},
+        "best_val_nll_sum": sum(best_nll.values()),
+        "best_epoch": int(history["best_epoch"]),
         "best_val_total": float(history["best_val_loss"]),
-        **{f"val_nll_{o}": float(best_val[f"nll_{o}"]) for o in OUTCOME_NAMES},
-        **{f"val_cindex_{o}": c for o, c in val_cindex(trainer, model, int(training_cfg["horizons"]["primary"])).items()},
+        **{f"val_cindex_{o}": c for o, c in val_cindex(trainer, selected, int(training_cfg["horizons"]["primary"])).items()},
     }
     (out / RESULT_FILE).write_text(json.dumps(result, indent=2))
     return result
@@ -152,10 +163,11 @@ def finished_result(run_dir, entry: dict) -> dict | None:
 
 
 def mark_winners(rows: list[dict]) -> list[dict]:
-    """winner = True for each model's config with the lowest best_val_total."""
+    """winner = True for each model's config with the lowest best_val_nll_sum (the sum of the
+    three per-outcome best val NLLs)."""
     best = {}
     for r in rows:
-        if r["model"] not in best or r["best_val_total"] < best[r["model"]]["best_val_total"]:
+        if r["model"] not in best or r["best_val_nll_sum"] < best[r["model"]]["best_val_nll_sum"]:
             best[r["model"]] = r
     return [{**r, "winner": r is best[r["model"]]} for r in rows]
 
@@ -167,13 +179,14 @@ def write_summary(rows: list[dict], out_dir) -> str:
         w = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
-    lines = ["| Model | Config | lr | wd | Best epoch | Epochs | Time (s) | Best val total | val NLL mort / MALO / CVD | val C mort / MALO / CVD | Winner |",
+    lines = ["| Model | Config | lr | wd | Epochs | Time (s) | Best epoch mort / MALO / CVD | Best val NLL mort / MALO / CVD | "
+             "Sum | val C mort / MALO / CVD | Winner |",
              "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         lines.append(
-            f"| {r['model']} | {r['config_id']} | {r['learning_rate']:.3g} | {r['weight_decay']:.3g} | {r['best_epoch']} | "
-            f"{r['epochs_run']} | {r['seconds']:.0f} | {r['best_val_total']:.4f} | "
-            + " / ".join(f"{r[f'val_nll_{o}']:.4f}" for o in OUTCOME_NAMES) + " | "
+            f"| {r['model']} | {r['config_id']} | {r['learning_rate']:.3g} | {r['weight_decay']:.3g} | {r['epochs_run']} | "
+            f"{r['seconds']:.0f} | " + " / ".join(str(r[f"best_epoch_{o}"]) for o in OUTCOME_NAMES) + " | "
+            + " / ".join(f"{r[f'best_val_nll_{o}']:.4f}" for o in OUTCOME_NAMES) + f" | {r['best_val_nll_sum']:.4f} | "
             + " / ".join(f"{r[f'val_cindex_{o}']:.3f}" for o in OUTCOME_NAMES) + f" | {'**WINNER**' if r['winner'] else ''} |"
         )
     table = "\n".join(lines)

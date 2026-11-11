@@ -146,7 +146,9 @@ def test_counts_use_at_risk_only(trained):
 
 
 def test_best_checkpoint_is_reloaded_not_last_epoch(tmp_path, monkeypatch):
+    """checkpoint_selection: total (previous behaviour): one checkpoint_best.pt on val total."""
     schema, training = _configs()
+    training = {**training, "training_loop": {**training["training_loop"], "checkpoint_selection": "total"}}
     visits, outcomes = generate_synthetic_cohort(n_patients=N_PATIENTS, seed=DATA_SEED)
     torch.manual_seed(0)
     trainer, model = evaluate_script.make_trainer("dynamic_deephit", visits, outcomes, schema, training)

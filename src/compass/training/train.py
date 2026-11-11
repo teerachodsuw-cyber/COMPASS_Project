@@ -12,10 +12,23 @@ orchestration mechanics -- epoch iteration, minibatching, optimizer step, checkp
 logging, early stopping -- are identical across all three architectures; duplicating that
 logic three times would risk subtle divergences becoming a confound in the eventual paired
 model comparison. Trainer never looks at any model's internal loss structure: it calls the
-shared model.compute_loss(batch) -> dict[str, Tensor] interface (base.py) and only ever reads
-the guaranteed "total" key for optimization/checkpointing/early-stopping decisions, plus
-whatever OTHER keys happen to be present (survival_nll, ranking_loss, ...) purely for logging
--- same principle as base.py's shared forward/predict_risk interface.
+shared model.compute_loss(batch) -> dict[str, Tensor] interface (base.py): it optimises the
+guaranteed "total" key, and selects checkpoints / early-stops on the per-outcome survival NLLs
+("nll_mortality", "nll_malo", "nll_cvd" -- every model returns these) or, with
+training_loop.checkpoint_selection: total, on "total". Other keys (survival_nll,
+ranking_loss, auxiliary_loss, ...) are logged only and never used for selection.
+
+Checkpoint selection (configs/training.yaml: training_loop.checkpoint_selection):
+- per_outcome (default): each outcome's validation NLL is tracked on its own; when it beats
+  that outcome's best so far, checkpoint_best_<outcome>.pt is saved. Early stopping waits
+  until NONE of the three outcomes has improved for `patience` epochs (any improvement resets
+  the counter). Evaluation uses outcome k's checkpoint for outcome k (load_selected_models).
+- total: the previous behaviour -- one checkpoint_best.pt on validation "total" loss, early
+  stopping on "total", every outcome evaluated from checkpoint_best.pt.
+checkpoint_best.pt (best "total") is written in both modes. fit() writes
+checkpoint_selection.json (mode, which checkpoint each outcome uses, best epochs / losses).
+The per-outcome bests and the patience counter are saved in every checkpoint and restored by
+resume().
 
 Landmark resampling policy (configs/training.yaml: landmarking.sampling =
 "one_random_landmark_per_subject_per_epoch"): TRAINING patients get a fresh random landmark
@@ -48,7 +61,9 @@ way to build landmark examples at all -- train_one_epoch/evaluate take bare pati
 not raw per-patient data, so the Trainer itself must hold the data to look patients up by id.
 """
 
+import copy
 import json
+import math
 import time
 from pathlib import Path
 
@@ -59,6 +74,7 @@ import torch
 from compass.data.landmarking import construct_landmark_example, death_date_of, sample_landmark
 from compass.data.preprocessing import run_preprocessing, scale_and_mask_examples
 from compass.data.splitting import data_fingerprint, save_split
+from compass.models.base import OUTCOME_NAMES
 from compass.training.batching import collate_examples
 from compass.training.targets import compute_last_visit_dates
 
@@ -67,6 +83,49 @@ from compass.training.targets import compute_last_visit_dates
 # (seed + 100_000 for val, seed + 200_000 for test) exactly, since that initial
 # run_preprocessing call is in fact how these fixed examples are built.
 _RESAMPLE_LANDMARKS_SEED_OFFSET = 900_000  # used only when evaluate(resample_landmarks=True)
+
+CHECKPOINT_SELECTION_MODES = ("per_outcome", "total")
+SELECTION_FILE = "checkpoint_selection.json"
+BEST_TOTAL_CHECKPOINT = "checkpoint_best.pt"
+
+
+def best_checkpoint_name(outcome: str) -> str:
+    return f"checkpoint_best_{outcome}.pt"
+
+
+def _fresh_selection_state() -> dict:
+    """Bests per selection key ("total" + each outcome) and the early-stopping counter."""
+    keys = ("total", *OUTCOME_NAMES)
+    return {"best_val": {k: math.inf for k in keys}, "best_epoch": {k: None for k in keys}, "epochs_without_improvement": 0}
+
+
+def outcome_checkpoints(checkpoint_dir) -> dict:
+    """{outcome: checkpoint path} as recorded by fit() in checkpoint_selection.json. A run
+    without that file (trained before per-outcome selection) has one checkpoint_best.pt,
+    used for every outcome."""
+    d = Path(checkpoint_dir)
+    f = d / SELECTION_FILE
+    if not f.exists():
+        return {o: d / BEST_TOTAL_CHECKPOINT for o in OUTCOME_NAMES}
+    files = json.loads(f.read_text())["checkpoints"]
+    return {o: d / files[o] for o in OUTCOME_NAMES}
+
+
+def load_selected_models(model, checkpoint_dir):
+    """The weights evaluation uses. If every outcome uses the same checkpoint (total
+    selection, or older runs): `model` itself with those weights. Otherwise
+    {outcome: a copy of `model` with that outcome's checkpoint weights} -- outcome k's
+    predictions must then come from entry k only (compass.evaluation.pipeline)."""
+    paths = outcome_checkpoints(checkpoint_dir)
+
+    def load_into(m, path):
+        m.load_state_dict(torch.load(path, weights_only=False)["model_state_dict"])
+        m.eval()
+        return m
+
+    if len(set(paths.values())) == 1:
+        return load_into(model, next(iter(paths.values())))
+    return {o: load_into(copy.deepcopy(model), path) for o, path in paths.items()}
 
 
 class Trainer:
@@ -92,7 +151,7 @@ class Trainer:
         for an LR scheduler, e.g. {"type": "StepLR", "step_size": 10, "gamma": 0.5} --
         none of the current configs set one, so the default is no scheduler).
         training_config: from configs/training.yaml (reads seed, splitting.train_frac/
-        val_frac/test_frac).
+        val_frac/test_frac, training_loop.checkpoint_selection: per_outcome (default) | total).
         visits_df, outcomes_df, continuous_columns, medication_columns, sex_categories,
         smoking_status_categories, horizons, administrative_cutoff: everything else
         run_preprocessing() needs -- see module docstring for why these are required here
@@ -112,6 +171,10 @@ class Trainer:
         self.num_time_bins = int(model_config["num_time_bins"])
         self.batch_size = int(model_config["batch_size"])
         self.seed = int(training_config["seed"])
+        self.checkpoint_selection = (training_config.get("training_loop") or {}).get("checkpoint_selection", "per_outcome")
+        if self.checkpoint_selection not in CHECKPOINT_SELECTION_MODES:
+            raise ValueError(f"training_loop.checkpoint_selection must be one of {CHECKPOINT_SELECTION_MODES}, "
+                             f"got {self.checkpoint_selection!r}")
 
         self.continuous_columns = list(continuous_columns)
         self.medication_columns = list(medication_columns)
@@ -178,6 +241,7 @@ class Trainer:
 
         self._resume_epoch = None
         self._resume_rng_state = None
+        self._resume_selection_state = None
 
     def fixed_examples(self, split: str) -> list[dict]:
         """The split's fixed landmark examples (scaled + masked), in split order, all at the
@@ -253,8 +317,8 @@ class Trainer:
 
         Returns the size-weighted epoch-average of whatever keys model.compute_loss returns
         (e.g. {"survival_nll", "ranking_loss", "auxiliary_loss", "total"} for Dynamic-DeepHit;
-        {"survival_nll", "total"} for TraCeR/SurvLatent ODE) -- generic over which keys exist,
-        per-outcome breakdown is not available since no model's compute_loss exposes it.
+        {"survival_nll", "total"} for TraCeR/SurvLatent ODE, plus nll_<outcome> for each
+        outcome from every model) -- generic over which keys exist.
         """
         self.model.train()
         per_batch = []
@@ -292,7 +356,7 @@ class Trainer:
             return f"total={m['total']:.4f} [{per_outcome}]"
         return f"  epoch {epoch}: train {part(train_metrics)} | val {part(val_metrics)} | {elapsed:.1f}s"
 
-    def _checkpoint(self, path: Path, epoch: int, rng: np.random.Generator, val_loss: float):
+    def _checkpoint(self, path: Path, epoch: int, rng: np.random.Generator, val_loss: float, selection_state: dict):
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
@@ -302,15 +366,51 @@ class Trainer:
                 "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler is not None else None,
                 "rng_state": rng.bit_generator.state,
                 "val_loss": val_loss,
+                "checkpoint_selection": self.checkpoint_selection,
+                "selection_state": copy.deepcopy(selection_state),
             },
             path,
         )
 
+    def _update_bests(self, state: dict, epoch: int, val_metrics: dict) -> list[str]:
+        """Update the bests in `state` from this epoch's validation metrics; return the keys
+        that improved. Outcome keys read ONLY the per-outcome survival NLL (nll_<outcome>),
+        never "total" or any ranking / auxiliary term."""
+        improved = []
+        for key in ("total", *OUTCOME_NAMES):
+            metric = "total" if key == "total" else f"nll_{key}"
+            if metric not in val_metrics:
+                if self.checkpoint_selection == "per_outcome" and key != "total":
+                    raise KeyError(f"per-outcome checkpoint selection needs '{metric}' in the validation losses")
+                continue
+            value = float(val_metrics[metric])
+            if value < state["best_val"][key]:
+                state["best_val"][key] = value
+                state["best_epoch"][key] = epoch
+                improved.append(key)
+        return improved
+
+    def _write_selection(self, checkpoint_dir: Path, state: dict):
+        per_outcome = self.checkpoint_selection == "per_outcome"
+        finite = lambda v: None if math.isinf(v) else v  # noqa: E731
+        summary = {
+            "checkpoint_selection": self.checkpoint_selection,
+            "checkpoints": {o: best_checkpoint_name(o) if per_outcome else BEST_TOTAL_CHECKPOINT for o in OUTCOME_NAMES},
+            "best_epoch": {o: state["best_epoch"][o] for o in OUTCOME_NAMES},
+            "best_val_nll": {o: finite(state["best_val"][o]) for o in OUTCOME_NAMES},
+            "best_total_epoch": state["best_epoch"]["total"],
+            "best_val_total": finite(state["best_val"]["total"]),
+            "epochs_without_improvement": state["epochs_without_improvement"],
+        }
+        (checkpoint_dir / SELECTION_FILE).write_text(json.dumps(summary, indent=2) + "\n")
+
     def resume(self, checkpoint_path: str) -> np.random.Generator:
-        """Load a checkpoint (model + optimizer + scheduler + rng state) and record where to
-        continue from. Call this BEFORE fit() -- fit() checks for a pending resume and
-        continues from the checkpointed epoch/rng state instead of starting fresh. Returns the
+        """Load a checkpoint (model + optimizer + scheduler + rng state + the per-outcome /
+        total bests and the early-stopping counter) and record where to continue from. Call
+        this BEFORE fit() -- fit() checks for a pending resume and continues from the
+        checkpointed epoch/rng state/bests/counter instead of starting fresh. Returns the
         restored rng (also stored internally), in case the caller wants it directly.
+        A checkpoint from before selection state was saved resumes with fresh bests (warned).
         """
         checkpoint = torch.load(checkpoint_path, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state_dict"])
@@ -320,6 +420,14 @@ class Trainer:
 
         rng = np.random.default_rng()
         rng.bit_generator.state = checkpoint["rng_state"]
+
+        saved_mode = checkpoint.get("checkpoint_selection")
+        if saved_mode is not None and saved_mode != self.checkpoint_selection:
+            raise ValueError(f"checkpoint was trained with checkpoint_selection={saved_mode!r}; "
+                             f"config says {self.checkpoint_selection!r}")
+        if checkpoint.get("selection_state") is None:
+            print("warning: checkpoint has no selection state (older run); resuming with fresh bests", flush=True)
+        self._resume_selection_state = copy.deepcopy(checkpoint.get("selection_state"))
 
         self._resume_epoch = int(checkpoint["epoch"])
         self._resume_rng_state = checkpoint["rng_state"]
@@ -337,19 +445,23 @@ class Trainer:
         """Full training loop: iterate epochs, train_one_epoch + evaluate each epoch, log both
         (JSON lines, checkpoint_dir/training_log.jsonl, appended across resumes), checkpoint
         (checkpoint_dir/checkpoint_latest.pt every checkpoint_every_n_epochs epochs;
-        checkpoint_dir/checkpoint_best.pt whenever val "total" loss improves). If
-        early_stopping_patience is set, stop once val "total" loss hasn't improved for that
-        many consecutive epochs. Fully reproducible given the same training_config seed AND
-        the same train_patients/val_patients ordering (the seed drives the one `rng` used for
-        every epoch's landmark sampling and minibatch shuffling, start to finish).
+        checkpoint_dir/checkpoint_best.pt whenever val "total" loss improves; with
+        per_outcome selection also checkpoint_best_<outcome>.pt whenever that outcome's val
+        NLL improves). Early stopping (if early_stopping_patience is set): per_outcome --
+        stop once NONE of the three outcomes' val NLL has improved for that many consecutive
+        epochs; total -- stop once val "total" hasn't. Fully reproducible given the same
+        training_config seed AND the same train_patients/val_patients ordering (the seed
+        drives the one `rng` used for every epoch's landmark sampling and minibatch
+        shuffling, start to finish).
 
-        If resume() was called first, continues from that checkpoint's epoch/rng state instead
-        of starting fresh from training_config's seed at epoch 0.
+        If resume() was called first, continues from that checkpoint's epoch/rng state,
+        bests and early-stopping counter instead of starting fresh at epoch 0.
 
         After the loop, the model's weights are RELOADED from checkpoint_best.pt (the
-        best-validation epoch), so whatever happens next -- evaluation, saving -- uses the
-        best weights, never the last epoch's. history["best_epoch"] / ["best_val_loss"]
-        record which epoch that was.
+        best-total epoch); history["best_epoch"] / ["best_val_loss"] record which epoch that
+        was. With per_outcome selection, evaluation instead loads each outcome's own
+        checkpoint (load_selected_models); history["best_epoch_per_outcome"] /
+        ["best_val_nll_per_outcome"] record those.
         """
         checkpoint_dir = Path(checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -366,8 +478,8 @@ class Trainer:
             start_epoch = 0
             rng = np.random.default_rng(self.seed)
 
-        best_val_loss = float("inf")
-        epochs_without_improvement = 0
+        state = copy.deepcopy(self._resume_selection_state) if self._resume_selection_state else _fresh_selection_state()
+        stop_keys = OUTCOME_NAMES if self.checkpoint_selection == "per_outcome" else ("total",)
         history = {"train": [], "val": []}
 
         for epoch in range(start_epoch, num_epochs):
@@ -386,24 +498,33 @@ class Trainer:
             print(self._epoch_line(epoch, train_metrics, val_metrics, elapsed), flush=True)
 
             val_loss = val_metrics["total"]
-            improved = val_loss < best_val_loss
-            if improved:
-                best_val_loss = val_loss
-                epochs_without_improvement = 0
-                self._checkpoint(checkpoint_dir / "checkpoint_best.pt", epoch, rng, val_loss)
+            improved = self._update_bests(state, epoch, val_metrics)
+            if any(k in improved for k in stop_keys):
+                state["epochs_without_improvement"] = 0
             else:
-                epochs_without_improvement += 1
+                state["epochs_without_improvement"] += 1
 
+            if "total" in improved:
+                self._checkpoint(checkpoint_dir / BEST_TOTAL_CHECKPOINT, epoch, rng, val_loss, state)
+            if self.checkpoint_selection == "per_outcome":
+                for outcome in OUTCOME_NAMES:
+                    if outcome in improved:
+                        self._checkpoint(checkpoint_dir / best_checkpoint_name(outcome), epoch, rng, val_loss, state)
             if (epoch + 1) % checkpoint_every_n_epochs == 0:
-                self._checkpoint(checkpoint_dir / "checkpoint_latest.pt", epoch, rng, val_loss)
+                self._checkpoint(checkpoint_dir / "checkpoint_latest.pt", epoch, rng, val_loss, state)
+            self._write_selection(checkpoint_dir, state)
 
-            if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
+            if early_stopping_patience is not None and state["epochs_without_improvement"] >= early_stopping_patience:
                 break
 
-        best_path = checkpoint_dir / "checkpoint_best.pt"
+        best_path = checkpoint_dir / BEST_TOTAL_CHECKPOINT
         if best_path.exists():
             best = torch.load(best_path, weights_only=False)
             self.model.load_state_dict(best["model_state_dict"])
             history["best_epoch"] = int(best["epoch"])
             history["best_val_loss"] = float(best["val_loss"])
+        history["checkpoint_selection"] = self.checkpoint_selection
+        history["best_epoch_per_outcome"] = {o: state["best_epoch"][o] for o in OUTCOME_NAMES}
+        history["best_val_nll_per_outcome"] = {o: state["best_val"][o] for o in OUTCOME_NAMES}
+        history["epochs_without_improvement"] = state["epochs_without_improvement"]
         return history

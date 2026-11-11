@@ -18,7 +18,13 @@ landmarking:
 
 training_loop:
   max_epochs: 100              # scripts/train.py --epochs overrides (v1 full run: 100)
-  early_stopping_patience: 10  # epochs without val total-loss improvement; null = no early stopping
+  early_stopping_patience: 10  # epochs without improvement (see checkpoint_selection); null = no early stopping
+  # per_outcome (default): one best checkpoint per outcome (checkpoint_best_<outcome>.pt), chosen on
+  #   that outcome's val survival NLL only (never DDH's ranking / auxiliary terms); early stopping
+  #   waits until NO outcome has improved for `early_stopping_patience` epochs; evaluation uses
+  #   outcome k's checkpoint for outcome k.
+  # total: previous behaviour -- one checkpoint_best.pt and early stopping on val total loss.
+  checkpoint_selection: per_outcome
 
 evaluation:
   # Landmark for val / test (and the training-split IPCW reference):

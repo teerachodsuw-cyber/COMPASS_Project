@@ -75,10 +75,14 @@ def train_one_model(name: str, args, visits_df, outcomes_df, schema, training_co
         checkpoint_every_n_epochs=args.checkpoint_every_n_epochs,
     )
 
-    # fit() has reloaded checkpoint_best.pt. No test-split loss is computed here: the test
-    # split is touched only by scripts/evaluate.py --split test --final (one-time reporting).
+    # fit() has reloaded checkpoint_best.pt (best total); evaluate.py loads per-outcome
+    # checkpoints when checkpoint_selection is per_outcome. No test-split loss is computed here:
+    # the test split is touched only by scripts/evaluate.py --split test --final (one-time reporting).
     print(f"{name}: final train total={history['train'][-1]['total']:.4f}  val total={history['val'][-1]['total']:.4f}  "
-          f"best epoch={history.get('best_epoch')} (val total={history.get('best_val_loss', float('nan')):.4f}, weights reloaded)")
+          f"best total epoch={history.get('best_epoch')} (val total={history.get('best_val_loss', float('nan')):.4f})")
+    per_outcome = "  ".join(f"{o} epoch {history['best_epoch_per_outcome'][o]} ({history['best_val_nll_per_outcome'][o]:.4f})"
+                            for o in history["best_epoch_per_outcome"])
+    print(f"{name}: checkpoint selection {history['checkpoint_selection']}; best val NLL per outcome: {per_outcome}")
     return {"history": history, "split": {"train": trainer.train_ids, "val": trainer.val_ids, "test": trainer.test_ids}}
 
 
@@ -136,8 +140,12 @@ def main():
     summary_path = f"{args.checkpoint_dir}/run_summary.json"
     with open(summary_path, "w") as f:
         json.dump(
-            {name: {"best_epoch": results[name]["history"].get("best_epoch"),
-                    "best_val_loss": results[name]["history"].get("best_val_loss")} for name in names},
+            {name: {"checkpoint_selection": results[name]["history"]["checkpoint_selection"],
+                    "best_epoch": results[name]["history"].get("best_epoch"),
+                    "best_val_loss": results[name]["history"].get("best_val_loss"),
+                    "best_epoch_per_outcome": results[name]["history"]["best_epoch_per_outcome"],
+                    "best_val_nll_per_outcome": results[name]["history"]["best_val_nll_per_outcome"]}
+             for name in names},
             f, indent=2,
         )
     print(f"Summary written to {summary_path}")

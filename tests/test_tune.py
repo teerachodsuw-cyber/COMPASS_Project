@@ -36,14 +36,25 @@ def _small_grid():
     return {**TUNING_CFG, "grid": {"learning_rate_multipliers": [1.0, 0.1], "weight_decay": [0.0, 1e-3]}}
 
 
-def test_grid_expands_to_nine_configs_per_model():
+def test_round2_grid_is_lr_0001_with_three_weight_decays_per_model():
     entries = tuning.expand_grid(TUNING_CFG, list(BASE_LR), BASE_LR)
+    assert len(entries) == 9
+    for model in BASE_LR:
+        mine = [e for e in entries if e["model"] == model]
+        assert len(mine) == 3 and len({e["config_id"] for e in mine}) == 3
+        assert {round(e["learning_rate"], 12) for e in mine} == {1e-3}
+        assert sorted(e["weight_decay"] for e in mine) == [0.0, 0.01, 0.1]
+        assert sorted(e["config_id"] for e in mine) == ["lr0.001_wd0", "lr0.001_wd0.01", "lr0.001_wd0.1"]
+    assert (TUNING_CFG["run_dir"], TUNING_CFG["out_dir"]) == ("runs/tune_v2", "outputs/tune_v2")
+
+
+def test_expand_grid_still_handles_multiple_learning_rates():
+    cfg = {**TUNING_CFG, "grid": {"learning_rate_multipliers": [1.0, 0.3, 0.1], "weight_decay": [0.0, 1e-4, 1e-3]}}
+    entries = tuning.expand_grid(cfg, list(BASE_LR), BASE_LR)
     assert len(entries) == 27
     for model in BASE_LR:
         mine = [e for e in entries if e["model"] == model]
-        assert len(mine) == 9 and len({e["config_id"] for e in mine}) == 9
         assert sorted({round(e["learning_rate"], 12) for e in mine}) == sorted({1e-3, 3e-4, 1e-4})
-        assert sorted({e["weight_decay"] for e in mine}) == [0.0, 1e-4, 1e-3]
 
 
 def test_weight_decay_and_learning_rate_reach_adamw(data, tmp_path):
@@ -66,7 +77,8 @@ def test_train_py_reads_epochs_and_patience_from_config():
     spec = importlib.util.spec_from_file_location("train_script", "scripts/train.py")
     train_script = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(train_script)
-    assert TRAINING_CFG["training_loop"] == {"max_epochs": 100, "early_stopping_patience": 10}
+    assert TRAINING_CFG["training_loop"] == {"max_epochs": 100, "early_stopping_patience": 10,
+                                             "checkpoint_selection": "per_outcome"}
     none = argparse.Namespace(epochs=None, early_stopping_patience=None)
     assert train_script.resolve_epochs_and_patience(none, TRAINING_CFG) == (100, 10)
     cli = argparse.Namespace(epochs=7, early_stopping_patience=3)
@@ -97,9 +109,13 @@ def test_every_config_uses_the_same_pinned_split(tuned):
 def test_results_and_summary_written(tuned):
     _, out_dir, _, entries, rows = tuned
     assert len(rows) == len(entries) == 4
+    outcomes = ("mortality", "malo", "cvd")
     for r in rows:
+        assert r["checkpoint_selection"] == "per_outcome"
         assert r["epochs_run"] <= 2 and 0 <= r["best_epoch"] < r["epochs_run"]
-        assert all(f"val_nll_{o}" in r and f"val_cindex_{o}" in r for o in ("mortality", "malo", "cvd"))
+        assert all(0 <= r[f"best_epoch_{o}"] < r["epochs_run"] for o in outcomes)
+        assert all(f"best_val_nll_{o}" in r and f"val_cindex_{o}" in r for o in outcomes)
+        assert r["best_val_nll_sum"] == pytest.approx(sum(r[f"best_val_nll_{o}"] for o in outcomes))
     header = (out_dir / "summary.csv").read_text().splitlines()[0].split(",")
     assert header == tuning.SUMMARY_COLUMNS
     assert "**WINNER**" in (out_dir / "summary.md").read_text()
@@ -118,13 +134,14 @@ def test_resume_skips_finished_configs(tuned, data, monkeypatch):
     assert [r["best_val_total"] for r in again] == [r["best_val_total"] for r in rows]
 
 
-def test_winner_is_lowest_best_val_loss():
+def test_winner_is_lowest_sum_of_per_outcome_best_losses():
+    # best_val_total points the other way on purpose: the winner must follow the per-outcome sum.
     rows = [
-        {"model": "a", "config_id": "1", "best_val_total": 1.5},
-        {"model": "a", "config_id": "2", "best_val_total": 1.2},
-        {"model": "a", "config_id": "3", "best_val_total": 1.9},
-        {"model": "b", "config_id": "1", "best_val_total": 0.8},
-        {"model": "b", "config_id": "2", "best_val_total": 0.9},
+        {"model": "a", "config_id": "1", "best_val_nll_sum": 1.5, "best_val_total": 1.0},
+        {"model": "a", "config_id": "2", "best_val_nll_sum": 1.2, "best_val_total": 3.0},
+        {"model": "a", "config_id": "3", "best_val_nll_sum": 1.9, "best_val_total": 2.0},
+        {"model": "b", "config_id": "1", "best_val_nll_sum": 0.8, "best_val_total": 9.0},
+        {"model": "b", "config_id": "2", "best_val_nll_sum": 0.9, "best_val_total": 0.1},
     ]
     marked = tuning.mark_winners(rows)
     assert [(r["model"], r["config_id"]) for r in marked if r["winner"]] == [("a", "2"), ("b", "1")]
@@ -133,7 +150,7 @@ def test_winner_is_lowest_best_val_loss():
 def test_tuned_winner_matches_minimum(tuned):
     _, _, _, _, rows = tuned
     winners = [r for r in rows if r["winner"]]
-    assert len(winners) == 1 and winners[0]["best_val_total"] == min(r["best_val_total"] for r in rows)
+    assert len(winners) == 1 and winners[0]["best_val_nll_sum"] == min(r["best_val_nll_sum"] for r in rows)
 
 
 def test_test_split_is_never_loaded(data, tmp_path, monkeypatch):
@@ -171,9 +188,9 @@ def test_test_split_is_never_loaded(data, tmp_path, monkeypatch):
     assert result["epochs_run"] == 1
 
 
-def test_dry_run_lists_27_configs_with_estimate(capsys, tmp_path):
+def test_dry_run_lists_9_configs_with_estimate(capsys, tmp_path):
     assert tune_script.main(["--dry-run", "--run-dir", str(tmp_path)]) == 0
     out = capsys.readouterr().out
-    assert out.startswith("27 configs (9 per model)")
-    assert sum(1 for line in out.splitlines() if line.startswith("| ") and line[2].isdigit()) == 27
+    assert out.startswith("9 configs (3 per model)")
+    assert sum(1 for line in out.splitlines() if line.startswith("| ") and line[2].isdigit()) == 9
     assert "Estimated total" in out and "ALL: typical" in out

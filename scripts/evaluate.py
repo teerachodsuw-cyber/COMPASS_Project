@@ -6,8 +6,10 @@ Usage:
     python scripts/evaluate.py --checkpoint-dir runs/ --data data/processed
     python scripts/evaluate.py --checkpoint-dir runs/ --split test --final   # ONE-TIME final report
 
-Steps: load each model's checkpoint_best.pt -> predict_risk at the 10-yr horizon (yearly
-CIF 1..10) on the split's fixed landmarks -> ground truth from build_targets (time, event,
+Steps: load each model's best checkpoint(s) -- per-outcome selection: outcome k's predictions
+come from checkpoint_best_<k>.pt; total selection (or runs without checkpoint_selection.json):
+checkpoint_best.pt for all -> predict_risk at the 10-yr horizon (yearly CIF 1..10) on the
+split's fixed landmarks -> ground truth from build_targets (time, event,
 competing, at_risk; at_risk == 0 excluded per outcome) -> metrics (mortality: Uno C + IBS;
 MALO / CVD: Wolbers C + Schoop competing-risk IBS; IPCW reference = the TRAINING split) ->
 patient-level paired bootstrap (same resample for all models).
@@ -30,7 +32,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
 import yaml
 
 from compass.data.preprocessing import build_feature_names
@@ -38,7 +39,7 @@ from compass.data.splitting import SplitMismatchError, check_fingerprint, data_f
 from compass.data.synthetic_generator import generate_synthetic_cohort
 from compass.evaluation.pipeline import evaluate_models, format_tables
 from compass.models.registry import MODEL_REGISTRY, build_model
-from compass.training.train import Trainer
+from compass.training.train import Trainer, load_selected_models
 
 log = logging.getLogger("evaluate")
 
@@ -88,14 +89,13 @@ def load_pinned_split(name: str, checkpoint_dir: str, visits_df, outcomes_df) ->
 
 
 def load_trained(name: str, checkpoint_dir: str, visits_df, outcomes_df, schema: dict, training_config: dict):
-    """(trainer, model): the saved split re-used and checkpoint_best.pt weights loaded
-    (never the latest)."""
+    """(trainer, model): the saved split re-used and the best checkpoint weights loaded (never
+    the latest). model is one model (total selection / older runs: checkpoint_best.pt) or
+    {outcome: model} (per-outcome selection: checkpoint_best_<outcome>.pt), as recorded in the
+    run's checkpoint_selection.json."""
     split = load_pinned_split(name, checkpoint_dir, visits_df, outcomes_df)
     trainer, model = make_trainer(name, visits_df, outcomes_df, schema, training_config, split=split)
-    best = torch.load(Path(checkpoint_dir) / name / "checkpoint_best.pt", weights_only=False)
-    model.load_state_dict(best["model_state_dict"])
-    model.eval()
-    return trainer, model
+    return trainer, load_selected_models(model, Path(checkpoint_dir) / name)
 
 
 def main(argv=None) -> int:
@@ -103,7 +103,7 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--split", choices=["val", "test"], default="val")
     p.add_argument("--final", action="store_true", help="Required for --split test (one-time final reporting).")
-    p.add_argument("--checkpoint-dir", required=True, help="train.py's --checkpoint-dir (holds <model>/checkpoint_best.pt)")
+    p.add_argument("--checkpoint-dir", required=True, help="train.py's --checkpoint-dir (holds <model>/checkpoint_best*.pt)")
     p.add_argument("--models", nargs="+", choices=list(MODEL_REGISTRY), default=list(MODEL_REGISTRY))
     p.add_argument("--data", default=None, help="Processed real-data dir (scripts/build_cohort.py). Omit for synthetic.")
     p.add_argument("--n-patients", type=int, default=1000, help="Synthetic only; checked against the saved fingerprint.")

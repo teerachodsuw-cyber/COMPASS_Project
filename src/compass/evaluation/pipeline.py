@@ -2,6 +2,10 @@
 -> ground truth from build_targets -> metrics -> paired bootstrap. Used by
 scripts/evaluate.py; everything here returns aggregates only.
 
+- Per-outcome checkpoints (training_loop.checkpoint_selection: per_outcome): a model is given
+  as {outcome: model}, and outcome k's predictions come from model k only
+  (predict_selected_cifs). A single model (total selection, or older runs) predicts all three.
+
 - Ground truth comes only from compass.training.targets.build_targets (via
   collate_examples): time, event, competing death, at_risk. Event codes for the metrics:
   1 = event, 2 = competing death (MALO / CVD), 0 = censored. at_risk == 0 rows are excluded
@@ -78,6 +82,14 @@ def predict_cifs(model, trainer, split: str, horizon: int) -> dict:
     return {name: risk[:, k, :] for k, name in enumerate(OUTCOME_NAMES)}
 
 
+def predict_selected_cifs(model, trainer, split: str, horizon: int) -> dict:
+    """model: one model (predicts every outcome) or {outcome: model} (per-outcome checkpoints:
+    outcome k's CIF comes from model k only, its other outputs are discarded)."""
+    if isinstance(model, dict):
+        return {name: predict_cifs(model[name], trainer, split, horizon)[name] for name in OUTCOME_NAMES}
+    return predict_cifs(model, trainer, split, horizon)
+
+
 def outcome_counts(ground_truth: dict, horizon: int) -> dict:
     out = {}
     for name, g in ground_truth.items():
@@ -92,7 +104,8 @@ def outcome_counts(ground_truth: dict, horizon: int) -> dict:
 
 
 def evaluate_models(trainers: dict, models: dict, split: str, horizon: int, n_bootstrap: int, seed: int) -> dict:
-    """trainers / models: {model_name: Trainer / model with best-checkpoint weights loaded}.
+    """trainers / models: {model_name: Trainer / best-checkpoint weights} -- each model entry
+    is one model, or {outcome: model} for per-outcome checkpoints (predict_selected_cifs).
     Returns a JSON-serialisable dict of aggregates."""
     names = list(models)
     ref_trainer = trainers[names[0]]
@@ -102,7 +115,7 @@ def evaluate_models(trainers: dict, models: dict, split: str, horizon: int, n_bo
         if other_ids != patient_ids:
             raise ValueError(f"model '{name}' was evaluated on a different {split} split / patient order")
     reference = censoring_reference_from_train(ref_trainer)
-    predictions = {name: predict_cifs(models[name], trainers[name], split, horizon) for name in names}
+    predictions = {name: predict_selected_cifs(models[name], trainers[name], split, horizon) for name in names}
 
     per_model, pairwise = paired_bootstrap(predictions, ground_truth, reference, horizon, n_iterations=n_bootstrap, seed=seed)
     return {

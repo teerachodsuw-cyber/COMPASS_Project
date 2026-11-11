@@ -1,14 +1,20 @@
 # Hyperparameter grid for scripts/tune.py (per model).
 # learning_rate = the model config's learning_rate x each multiplier; weight_decay = each value.
-# 3 x 3 = 9 configs per model, 27 in all. Every config uses the same pinned split, seed and
-# max_epochs / early_stopping_patience (configs/training.yaml: training_loop).
+# Every config uses the same pinned split, seed and max_epochs / early_stopping_patience /
+# checkpoint_selection (configs/training.yaml: training_loop). Winner per model = lowest sum of
+# the three per-outcome best val NLLs.
+#
+# Round 1 (tune_v1): lr multipliers [1.0, 0.3, 0.1] x weight_decay [0, 1e-4, 1e-3], total-loss
+# selection -- lr 0.001 best for all three models; weight decay <= 1e-3 had no effect.
+# Round 2 (tune_v2): lr 0.001 only; weight decay at strengths that can matter; per-outcome
+# checkpoint selection. 1 x 3 = 3 configs per model, 9 in all.
 grid:
-  learning_rate_multipliers: [1.0, 0.3, 0.1]
-  weight_decay: [0.0, 1.0e-4, 1.0e-3]
+  learning_rate_multipliers: [1.0]
+  weight_decay: [0.0, 0.01, 0.1]
 
 models: [dynamic_deephit, tracer, survlatent_ode]
-run_dir: runs/tune_v1       # <run_dir>/<model>/<config_id>/  (git-ignored)
-out_dir: outputs/tune_v1    # summary.csv + summary.md         (git-ignored)
+run_dir: runs/tune_v2       # <run_dir>/<model>/<config_id>/  (git-ignored)
+out_dir: outputs/tune_v2    # summary.csv + summary.md         (git-ignored)
 
 # Used only by --dry-run to estimate run time: measured on the real data in the v1 full run
 # (runs/full_v1; seconds per epoch incl. validation, and epochs run before early stopping).

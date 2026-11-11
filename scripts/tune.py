@@ -11,7 +11,7 @@ early-stopping patience: configs/training.yaml (training_loop), the same for eve
 One pinned split for every config (<run_dir>/split.json; --split-from <training run dir> to
 reuse an existing run's split). Resumable: configs with a result.json are skipped. The test
 split is never loaded. Writes <out_dir>/summary.csv and summary.md, marking each model's
-winner (lowest best total val loss).
+winner (lowest sum of the three per-outcome best val NLLs).
 """
 
 import argparse
