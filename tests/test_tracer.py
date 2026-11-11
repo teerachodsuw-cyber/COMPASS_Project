@@ -198,9 +198,7 @@ def test_factorized_attention_shapes():
     seq_lengths = torch.tensor([3, 2])
     elapsed_days = torch.zeros(batch, seq_len)
 
-    gate_weight = model.compute_decay_gate(mask, elapsed_days)
-    embed_input = torch.stack([values * gate_weight, gate_weight], dim=-1)
-    feature_embed = model.feature_embed(embed_input)
+    feature_embed = model.input_embedding(values, mask, elapsed_days)  # paper Eq. 4
     assert feature_embed.shape == (batch, seq_len, num_features, 8)  # feature_embed_dim=8
 
     covariate_out = model._covariate_attention(feature_embed)
@@ -340,3 +338,82 @@ def test_tau_changes_after_a_few_optimiser_steps(real_pipeline_batch):
     tau_after = model.decay_tau_years().detach()
     assert not torch.allclose(tau_after, tau_before)
     assert (tau_after > 0).all()
+
+
+# ---- paper Eq. 4 input embedding (Ries & Seth, arXiv:2512.18129) ----------------------------
+
+
+def _eq4_inputs(gap_days=180.0):
+    """1 patient, 3 visits, 3 features. Feature 0 observed at every visit; feature 1 observed
+    at visit 0 then missing (stale by gap_days, then 2 * gap_days); feature 2 always missing."""
+    values = torch.tensor([[[0.5, 1.2, 0.0], [0.7, 0.0, 0.0], [0.9, 0.0, 0.0]]])
+    mask = torch.tensor([[[1.0, 1.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]])
+    elapsed = torch.tensor([[0.0, gap_days, gap_days]])
+    return values, mask, elapsed, torch.tensor([3])
+
+
+def test_eq4_missing_value_does_not_change_output():
+    torch.manual_seed(0)
+    model = _small_model(num_features=3).eval()
+    values, mask, elapsed, lengths = _eq4_inputs()
+    with torch.no_grad():
+        base = model.forward(values, mask, lengths, elapsed)
+        tampered = values.clone()
+        tampered[mask == 0] = 123.0  # arbitrary junk where the entry is missing (zero-filled upstream)
+        out = model.forward(tampered, mask, lengths, elapsed)
+        emb_base = model.input_embedding(values, mask, elapsed)
+        emb_tampered = model.input_embedding(tampered, mask, elapsed)
+    assert torch.equal(emb_base, emb_tampered)
+    for name in OUTCOME_NAMES:
+        assert torch.equal(base[name], out[name])
+
+
+def test_eq4_missing_entry_is_decayed_missing_embedding_and_shrinks_with_staleness():
+    torch.manual_seed(0)
+    model = _small_model(num_features=3)
+    values, mask, elapsed, _ = _eq4_inputs(gap_days=180.0)
+    with torch.no_grad():
+        emb = model.input_embedding(values, mask, elapsed)
+        tau = model.decay_tau_years()
+        z = model.missing_embed
+        for t, delta_days in [(1, 180.0), (2, 360.0)]:  # feature 1: last observed at visit 0
+            expected = z[1] * torch.exp(torch.tensor(-(delta_days / 365.25)) / tau[1])
+            assert torch.allclose(emb[0, t, 1], expected, atol=1e-6)
+        # feature 2 never observed: the 10-yr sentinel -> decayed to ~0
+        assert torch.allclose(emb[0, 0, 2], z[2] * torch.exp(-model.max_staleness_years / tau[2]), atol=1e-7)
+    norms = [emb[0, t, 1].norm().item() for t in (1, 2)]
+    assert norms[1] < norms[0]  # more stale -> smaller
+    # and with a larger gap the same entry is smaller still
+    with torch.no_grad():
+        emb_long = model.input_embedding(*_eq4_inputs(gap_days=365.0)[:3])
+    assert emb_long[0, 1, 1].norm() < emb[0, 1, 1].norm()
+
+
+def test_eq4_observed_entry_ignores_missing_embedding():
+    torch.manual_seed(0)
+    model = _small_model(num_features=3)
+    values, mask, elapsed, _ = _eq4_inputs()
+    with torch.no_grad():
+        before = model.input_embedding(values, mask, elapsed)
+        model.missing_embed.add_(torch.randn_like(model.missing_embed) * 5.0)
+        after = model.input_embedding(values, mask, elapsed)
+    observed = mask.bool()
+    assert torch.equal(before[observed], after[observed])          # z_d has no effect when observed
+    assert not torch.equal(before[~observed], after[~observed])    # ... but does when missing
+    # observed branch is the per-feature value embedding Embed_d(x)
+    expected = values[0, 0, 0] * model.value_embed_weight[0] + model.value_embed_bias[0]
+    assert torch.allclose(before[0, 0, 0], expected)
+
+
+def test_eq4_gradients_reach_missing_embedding_and_tau():
+    torch.manual_seed(0)
+    model = _small_model(num_features=3)
+    values, mask, elapsed, lengths = _eq4_inputs()
+    hazards = model.forward(values, mask, lengths, elapsed)
+    sum(h.sum() for h in hazards.values()).backward()
+    assert model.missing_embed.grad is not None
+    assert model.missing_embed.grad[1].abs().sum() > 0   # stale feature: gradient reaches z_d
+    assert model.missing_embed.grad[0].abs().sum() == 0  # always observed: z_d unused
+    assert model.decay_rate_raw.grad is not None
+    assert model.decay_rate_raw.grad[1].abs() > 0        # gradient reaches tau_d of the stale feature
+    assert model.value_embed_weight.grad[0].abs().sum() > 0

@@ -8,10 +8,16 @@ backbone":
 1. Missingness handling: per this project's locked decision, each candidate architecture
    keeps its OWN native missingness mechanism, to keep model comparison a fair fight between
    complete systems rather than standardizing away real architectural differences.
-   Dynamic-DeepHit uses mask+zero-fill (concat value and binary mask). TRACER instead uses a
-   continuous time-decay gate: weight = exp(-time_since_last_observed / tau), tau a
-   learnable per-feature decay time constant in YEARS (initialised at ~0.5 yr, the scale of
-   visit gaps). time_since_last_observed is derived here, in years, per feature,
+   Dynamic-DeepHit uses mask+zero-fill (concat value and binary mask). TRACER instead uses
+   the paper's input embedding (Ries & Seth, arXiv:2512.18129, Eq. 4), per feature d at
+   visit t:
+       observed: zeta = Embed_d(x)                     (per-feature value embedding)
+       missing:  zeta = z_d * exp(-delta / tau_d)      (learned per-feature "missing"
+                                                         embedding, decayed by staleness)
+   delta = years since feature d was last actually observed; tau_d a learnable per-feature
+   decay time constant in YEARS (initialised at ~0.5 yr, the scale of visit gaps; the paper's
+   rate is gamma_d = 1 / tau_d). The zero-filled value of a missing entry never enters the
+   model. time_since_last_observed (delta) is derived here, in years, per feature,
    per timestep, from the mask sequence + elapsed_days (see compute_decay_gate()) --
    elapsed_days itself comes from compass.training.batching.collate_examples (shared,
    derived from real visit dates), but the per-FEATURE staleness tracking is TRACER-specific
@@ -71,8 +77,13 @@ class TracerModel(CompassSurvivalModel):
         raw_init = math.log(math.expm1(tau_init_years - TAU_EPS))  # inverse softplus
         self.decay_rate_raw = nn.Parameter(torch.full((num_features,), raw_init))
 
-        # [gated_value, gate_weight] per feature per timestep -> per-feature embedding.
-        self.feature_embed = nn.Linear(2, feature_embed_dim)
+        # Paper Eq. 4 input embedding, per feature d (see input_embedding()):
+        # Embed_d(x) = x * value_embed_weight[d] + value_embed_bias[d]  (observed entries)
+        # z_d = missing_embed[d], decayed by exp(-delta / tau_d)       (missing entries)
+        # Initialised like an nn.Linear(1, feature_embed_dim) per feature (U(-1, 1)).
+        self.value_embed_weight = nn.Parameter(torch.empty(num_features, feature_embed_dim).uniform_(-1.0, 1.0))
+        self.value_embed_bias = nn.Parameter(torch.empty(num_features, feature_embed_dim).uniform_(-1.0, 1.0))
+        self.missing_embed = nn.Parameter(torch.empty(num_features, feature_embed_dim).uniform_(-1.0, 1.0))
 
         self.covariate_attn = nn.MultiheadAttention(
             embed_dim=feature_embed_dim, num_heads=covariate_attention_heads, dropout=dropout, batch_first=True
@@ -130,6 +141,21 @@ class TracerModel(CompassSurvivalModel):
         """(num_features,) decay time constant tau in years, always positive."""
         return F.softplus(self.decay_rate_raw) + TAU_EPS
 
+    def input_embedding(self, values: torch.Tensor, mask: torch.Tensor, elapsed_days: torch.Tensor) -> torch.Tensor:
+        """Paper Eq. 4 per-feature input embedding zeta: (batch, seq_len, num_features, E).
+
+        observed (mask == 1): Embed_d(x) = x * value_embed_weight[d] + value_embed_bias[d]
+        missing  (mask == 0): z_d * exp(-delta / tau_d), delta = years since feature d was
+                              last observed (compute_decay_gate gives exp(-delta / tau_d))
+        torch.where selects per entry, so a missing entry's zero-filled value never reaches
+        the output (nor its gradient). Never-missing features (medications, sex, smoking)
+        always take the observed branch.
+        """
+        observed_embed = values.unsqueeze(-1) * self.value_embed_weight + self.value_embed_bias
+        decay = self.compute_decay_gate(mask, elapsed_days).unsqueeze(-1)  # (batch, seq_len, num_features, 1)
+        missing_embed = self.missing_embed * decay
+        return torch.where(mask.bool().unsqueeze(-1), observed_embed, missing_embed)
+
     def _covariate_attention(self, feature_embed: torch.Tensor) -> torch.Tensor:
         """Self-attention across features, independently per (batch, timestep).
         feature_embed: (batch, seq_len, num_features, feature_embed_dim).
@@ -151,11 +177,7 @@ class TracerModel(CompassSurvivalModel):
         return self.temporal_encoder(x, mask=causal_mask, src_key_padding_mask=key_padding_mask)
 
     def _encode(self, values: torch.Tensor, mask: torch.Tensor, seq_lengths: torch.Tensor, elapsed_days: torch.Tensor):
-        gate_weight = self.compute_decay_gate(mask, elapsed_days)
-        gated_value = values * gate_weight
-
-        embed_input = torch.stack([gated_value, gate_weight], dim=-1)  # (batch, seq_len, num_features, 2)
-        feature_embed = self.feature_embed(embed_input)
+        feature_embed = self.input_embedding(values, mask, elapsed_days)  # paper Eq. 4
 
         covariate_out = self._covariate_attention(feature_embed)
         pooled = covariate_out.mean(dim=2)  # pool across features -> (batch, seq_len, feature_embed_dim)
@@ -165,7 +187,7 @@ class TracerModel(CompassSurvivalModel):
 
         last_idx = (seq_lengths - 1).clamp(min=0)
         context = temporal_out[torch.arange(temporal_out.shape[0], device=temporal_out.device), last_idx]
-        return context, gate_weight
+        return context, feature_embed
 
     def forward(
         self,
