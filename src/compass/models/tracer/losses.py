@@ -21,8 +21,9 @@ def tracer_survival_loss(
     {name}_at_risk per outcome, from compass.training.batching.collate_examples (the same targets Dynamic-
     DeepHit uses, so the two architectures are compared on identical censoring semantics).
 
-    Returns {"survival_nll": total, "total": total} -- total loss IS the survival NLL, sum
-    of the three outcomes' independent contributions, unweighted. Nothing else is added.
+    Returns {"survival_nll", "total", "nll_mortality", "nll_malo", "nll_cvd"} -- total loss IS
+    the survival NLL, the unweighted sum of the three outcomes' independent contributions (also
+    returned per outcome, for logging). Nothing else is added.
     """
     nll_terms = {
         name: discrete_time_survival_nll(
@@ -35,4 +36,4 @@ def tracer_survival_loss(
         for name in OUTCOME_NAMES
     }
     total = sum(nll_terms[name] for name in OUTCOME_NAMES)  # unweighted sum (no class-imbalance weighting)
-    return {"survival_nll": total, "total": total}
+    return {"survival_nll": total, "total": total, **{f"nll_{name}": nll_terms[name] for name in OUTCOME_NAMES}}

@@ -210,7 +210,7 @@ def test_loss_components_and_total(real_pipeline_batch):
 
     loss_dict = model.compute_loss(batch)
 
-    assert set(loss_dict.keys()) == {"survival_nll", "ranking_loss", "auxiliary_loss", "total"}
+    assert set(loss_dict.keys()) == {"survival_nll", "ranking_loss", "auxiliary_loss", "total", "nll_mortality", "nll_malo", "nll_cvd"}
     expected_total = (
         loss_dict["survival_nll"] + model.ranking_weight * loss_dict["ranking_loss"] + model.auxiliary_weight * loss_dict["auxiliary_loss"]
     )

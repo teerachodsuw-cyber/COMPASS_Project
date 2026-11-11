@@ -54,3 +54,21 @@ def test_construct_landmark_example_structure():
     assert list(example["input_visits"]["visit_date"]) == list(pd.to_datetime(["2015-01-01", "2016-01-01"]))
     # censoring-blind outcome labels were removed: targets come only from build_targets
     assert "outcome_labels" not in example
+
+
+def test_first_landmark_skips_pre_index_and_death_date_visits():
+    import pytest
+
+    from compass.data.landmarking import first_landmark, select_landmark
+
+    visits = pd.DataFrame({"patient_id": ["P"] * 4,
+                           "visit_date": pd.to_datetime(["2014-12-01", "2015-02-01", "2016-01-01", "2017-01-01"])})
+    assert first_landmark(visits, index_date=pd.Timestamp("2015-01-15"), death_date=pd.NaT) == pd.Timestamp("2015-02-01")
+    # visits on/after index 2016-01-01 are 2016-01-01 (= the death date, not valid) and 2017 (after death)
+    with pytest.raises(ValueError, match="no valid landmark"):
+        first_landmark(visits, index_date=pd.Timestamp("2016-01-01"), death_date=pd.Timestamp("2016-01-01"))
+    rng = np.random.default_rng(0)
+    assert select_landmark(visits, rng, "first_post_index", index_date=pd.Timestamp("2015-01-15"), death_date=pd.NaT) \
+        == pd.Timestamp("2015-02-01")
+    with pytest.raises(ValueError, match="unknown landmark rule"):
+        select_landmark(visits, rng, "last", index_date=pd.Timestamp("2015-01-15"), death_date=pd.NaT)

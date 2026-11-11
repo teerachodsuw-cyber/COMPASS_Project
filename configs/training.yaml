@@ -14,7 +14,13 @@ splitting:
   test_frac: 0.15
 
 landmarking:
-  sampling: "one_random_landmark_per_subject_per_epoch"
+  sampling: "one_random_landmark_per_subject_per_epoch"  # training only
+
+evaluation:
+  # Landmark for val / test (and the training-split IPCW reference):
+  #   first_post_index (default) = each patient's FIRST visit on/after index_date and before death
+  #   random = one random valid visit (seeded), e.g. for random / serial-landmark evaluation later
+  landmark: first_post_index
 
 # Class-imbalance outcome weighting: dropped (decision 2026-11-11). All three models sum the
 # per-outcome survival losses unweighted.

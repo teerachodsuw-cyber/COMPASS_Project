@@ -196,3 +196,88 @@ def test_all_three_models_use_same_split(schema, training_config, synthetic_data
     assert trainer_ddh.train_ids == trainer_tracer.train_ids == trainer_survlatent.train_ids
     assert trainer_ddh.val_ids == trainer_tracer.val_ids == trainer_survlatent.val_ids
     assert trainer_ddh.test_ids == trainer_tracer.test_ids == trainer_survlatent.test_ids
+
+
+# ---- evaluation landmark rule (configs/training.yaml: evaluation.landmark) -----------------
+
+
+def _first_candidate(patient_visits, index_date, death_date):
+    d = patient_visits["visit_date"]
+    ok = d >= index_date
+    if pd.notna(death_date):
+        ok &= d < death_date
+    return d[ok].min()
+
+
+@pytest.fixture(scope="module")
+def shifted_index_data(synthetic_data):
+    """Synthetic cohort with index_date moved to each patient's 2nd visit (when there is one),
+    so the first VALID landmark differs from the first visit."""
+    visits_df, outcomes_df = synthetic_data
+    second = visits_df.groupby("patient_id")["visit_date"].apply(lambda s: s.sort_values().iloc[min(1, len(s) - 1)])
+    shifted = outcomes_df.copy()
+    shifted["index_date"] = shifted["patient_id"].map(second)
+    return visits_df, shifted
+
+
+def _expected_first_landmarks(trainer, visits_df, outcomes_df, ids):
+    o = outcomes_df.set_index("patient_id")
+    out = {}
+    for pid in ids:
+        death = o.loc[pid, "mortality_date"] if o.loc[pid, "mortality_event"] == 1 else pd.NaT
+        out[pid] = _first_candidate(visits_df[visits_df.patient_id == pid], o.loc[pid, "index_date"], death)
+    return out
+
+
+def test_eval_landmark_is_first_post_index_for_val_test_and_ipcw_reference(schema, training_config, shifted_index_data, data_columns):
+    visits_df, outcomes_df = shifted_index_data
+    assert training_config["evaluation"]["landmark"] == "first_post_index"
+    trainer = _make_trainer("dynamic_deephit", {}, schema, training_config, shifted_index_data, data_columns)
+    first_visit = visits_df.groupby("patient_id")["visit_date"].min()
+    for split in ("val", "test", "train"):  # "train" = the IPCW reference examples
+        examples = trainer.fixed_examples(split)
+        expected = _expected_first_landmarks(trainer, visits_df, outcomes_df, [ex["patient_id"] for ex in examples])
+        assert all(ex["landmark_date"] == expected[ex["patient_id"]] for ex in examples), split
+        assert any(ex["landmark_date"] != first_visit[ex["patient_id"]] for ex in examples), split  # non-trivial
+
+
+def test_training_landmarks_stay_random(schema, training_config, shifted_index_data, data_columns):
+    visits_df, outcomes_df = shifted_index_data
+    trainer = _make_trainer("dynamic_deephit", {}, schema, training_config, shifted_index_data, data_columns)
+    ids = trainer.train_ids[:80]
+    expected = _expected_first_landmarks(trainer, visits_df, outcomes_df, ids)
+    rng = np.random.default_rng(0)
+    epoch_a = {ex["patient_id"]: ex["landmark_date"] for ex in trainer._build_examples_for(ids, rng)}
+    epoch_b = {ex["patient_id"]: ex["landmark_date"] for ex in trainer._build_examples_for(ids, rng)}
+    assert any(epoch_a[p] != epoch_b[p] for p in ids)            # vary across epochs
+    assert any(epoch_a[p] != expected[p] for p in ids)           # not the first-landmark rule
+    o = outcomes_df.set_index("patient_id")
+    assert all(epoch_a[p] >= o.loc[p, "index_date"] for p in ids)  # still valid (on/after index)
+
+
+def test_eval_landmark_random_setting(schema, training_config, shifted_index_data, data_columns):
+    visits_df, outcomes_df = shifted_index_data
+    cfg = {**training_config, "evaluation": {"landmark": "random"}}
+    trainer = _make_trainer("dynamic_deephit", {}, schema, cfg, shifted_index_data, data_columns)
+    examples = trainer.fixed_examples("val")
+    expected = _expected_first_landmarks(trainer, visits_df, outcomes_df, [ex["patient_id"] for ex in examples])
+    assert trainer.eval_landmark == "random"
+    assert any(ex["landmark_date"] != expected[ex["patient_id"]] for ex in examples)
+
+
+# ---- per-outcome loss logging --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["dynamic_deephit", "tracer", "survlatent_ode"])
+def test_training_log_has_per_outcome_losses(name, schema, training_config, synthetic_data, data_columns, tmp_path, capsys):
+    import json
+
+    trainer = _make_trainer(name, {}, schema, training_config, synthetic_data, data_columns)
+    trainer.fit(trainer.train_ids, trainer.val_ids, num_epochs=1, checkpoint_dir=str(tmp_path))
+    row = json.loads((tmp_path / "training_log.jsonl").read_text().splitlines()[0])
+    for part in ("train", "val"):
+        for outcome in ("mortality", "malo", "cvd"):
+            assert np.isfinite(row[part][f"nll_{outcome}"]), (part, outcome)
+    console = capsys.readouterr().out
+    assert "epoch 0: train total=" in console
+    assert all(f"{o}=" in console for o in ("mortality", "malo", "cvd"))

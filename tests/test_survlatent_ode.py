@@ -274,3 +274,81 @@ def test_diverges_from_other_two_models(real_pipeline_setup):
         assert not torch.allclose(ddh_out[name], tracer_out[name]), f"{name}: DDH and TraCeR produced identical output"
         assert not torch.allclose(ddh_out[name], survlatent_out[name]), f"{name}: DDH and SurvLatentODE produced identical output"
         assert not torch.allclose(tracer_out[name], survlatent_out[name]), f"{name}: TraCeR and SurvLatentODE produced identical output"
+
+
+# ---- solver speed: tolerances + one integration per batch ----------------------------------
+
+
+def _ode_for_speed(num_features, rtol, atol):
+    torch.manual_seed(7)
+    return SurvLatentODEModel(num_features=num_features, latent_dim=16, ode_hidden_dim=32, cause_head_hidden_dim=16,
+                              num_time_bins=30, solver_method="dopri5", rtol=rtol, atol=atol)
+
+
+def _old_style_loss(model, state, batch):
+    """The previous computation: one full integration per outcome (via _outcome_nll)."""
+    from compass.models.survlatent_ode.losses import _outcome_nll
+
+    return sum(_outcome_nll(model, state, batch[f"{n}_event_indicator"], batch[f"{n}_target_days"], n, batch[f"{n}_at_risk"])
+               for n in OUTCOME_NAMES)
+
+
+def test_new_solver_settings_change_loss_by_less_than_one_percent(real_pipeline_setup):
+    from compass.models.survlatent_ode.losses import survlatent_ode_survival_loss
+
+    batch, num_features = real_pipeline_setup
+    old = _ode_for_speed(num_features, rtol=1e-7, atol=1e-9)   # torchdiffeq defaults = previous behaviour
+    new = _ode_for_speed(num_features, rtol=1e-3, atol=1e-4)   # configured tolerances
+    new.load_state_dict(old.state_dict())
+    with torch.no_grad():
+        state_old = old.encode_trajectory(batch["values"], batch["mask"], batch["seq_lengths"], batch["elapsed_days"])
+        loss_old = float(_old_style_loss(old, state_old, batch))
+        state_new = new.encode_trajectory(batch["values"], batch["mask"], batch["seq_lengths"], batch["elapsed_days"])
+        loss_new = float(survlatent_ode_survival_loss(new, state_new, batch)["total"])
+    assert abs(loss_new - loss_old) / abs(loss_old) < 0.01, (loss_old, loss_new)
+
+
+def test_single_integration_matches_per_outcome_and_uses_fewer_solves(real_pipeline_setup, monkeypatch):
+    from compass.models.survlatent_ode.losses import survlatent_ode_survival_loss
+
+    batch, num_features = real_pipeline_setup
+    model = _ode_for_speed(num_features, rtol=1e-7, atol=1e-9)
+    calls = {"n": 0}
+    real = model._evolve_with_hazard_integral
+
+    def counting(h, days):
+        calls["n"] += 1
+        return real(h, days)
+
+    monkeypatch.setattr(model, "_evolve_with_hazard_integral", counting)
+    with torch.no_grad():
+        state = model.encode_trajectory(batch["values"], batch["mask"], batch["seq_lengths"], batch["elapsed_days"])
+        calls["n"] = 0
+        per_outcome = float(_old_style_loss(model, state, batch))
+        per_outcome_calls = calls["n"]
+        calls["n"] = 0
+        out = survlatent_ode_survival_loss(model, state, batch)
+        single_calls = calls["n"]
+    assert abs(float(out["total"]) - per_outcome) / abs(per_outcome) < 1e-4
+    assert set(out) >= {"nll_mortality", "nll_malo", "nll_cvd"}
+    max_years = float(max(batch[f"{n}_target_days"].max() for n in OUTCOME_NAMES)) / 365.25
+    assert single_calls <= int(np.ceil(max_years)) + len(OUTCOME_NAMES) + 1
+    assert single_calls < per_outcome_calls
+
+
+def test_solver_tolerances_are_passed_to_odeint(monkeypatch):
+    import compass.models.survlatent_ode.model as ode_module
+
+    seen = []
+    real_odeint = ode_module.odeint
+
+    def spy(*a, **kw):
+        seen.append((kw.get("rtol"), kw.get("atol")))
+        return real_odeint(*a, **kw)
+
+    monkeypatch.setattr(ode_module, "odeint", spy)
+    model = SurvLatentODEModel(num_features=2, latent_dim=4, ode_hidden_dim=8, cause_head_hidden_dim=4,
+                               num_time_bins=3, solver_method="dopri5", rtol=1e-3, atol=1e-4)
+    with torch.no_grad():
+        model.forward(torch.zeros(1, 2, 2), torch.ones(1, 2, 2), torch.tensor([2]), torch.tensor([[0.0, 100.0]]))
+    assert seen and all(s == (1e-3, 1e-4) for s in seen)

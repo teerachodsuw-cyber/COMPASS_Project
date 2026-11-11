@@ -149,4 +149,5 @@ class DynamicDeepHitModel(CompassSurvivalModel):
             "ranking_loss": total_ranking,
             "auxiliary_loss": aux_loss,
             "total": total,
+            **{f"nll_{name}": nll_terms[name] for name in OUTCOME_NAMES},  # per-outcome survival NLL (logging)
         }

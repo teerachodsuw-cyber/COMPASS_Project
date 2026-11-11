@@ -15,6 +15,8 @@ batch_size: 64           # placeholder (smaller than the other two models' defau
 # autodiff gives exact gradients through the actual solver steps rather than the adjoint's
 # separately-solved backward-time ODE.
 solver_method: dopri5    # placeholder; 'rk4' (fixed-step) is a faster alternative if needed
+rtol: 1.0e-3             # dopri5 relative tolerance (torchdiffeq default 1e-7 was far tighter than needed)
+atol: 1.0e-4             # dopri5 absolute tolerance (torchdiffeq default 1e-9)
 
 # Discrete-time comparison interface only (see hazards_at_bins() in model.py) -- the model
 # itself is continuous internally. Same yearly-bin scheme as Dynamic-DeepHit/TraCeR for

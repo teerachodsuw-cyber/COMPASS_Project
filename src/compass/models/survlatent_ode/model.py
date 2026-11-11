@@ -50,13 +50,21 @@ class SurvLatentODEModel(CompassSurvivalModel):
         num_time_bins: int = 13,
         bin_width_years: float = 1.0,
         solver_method: str = "dopri5",
+        rtol: float = 1e-3,
+        atol: float = 1e-4,
     ):
+        """rtol / atol: adaptive-solver (dopri5) tolerances, configurable
+        (configs/model_survlatent_ode.yaml). torchdiffeq's own defaults (1e-7 / 1e-9) are far
+        tighter than this model needs and made training slow. Fixed-step solvers (rk4)
+        ignore them."""
         super().__init__()
         self.num_features = num_features
         self.latent_dim = latent_dim
         self.num_time_bins = num_time_bins
         self.bin_width_years = bin_width_years
         self.solver_method = solver_method
+        self.rtol = rtol
+        self.atol = atol
 
         # dh/dt = f(h) -- autonomous latent dynamics. Final tanh bounds the (unscaled, per-
         # tau) derivative to [-1,1] elementwise: an unconstrained MLP vector field has no
@@ -123,7 +131,7 @@ class SurvLatentODEModel(CompassSurvivalModel):
         def scaled_func(tau, y):
             return self.ode_func(y) * real_years.unsqueeze(-1)
 
-        solution = odeint(scaled_func, h, _TAU_SPAN.to(h.device), method=self.solver_method)
+        solution = odeint(scaled_func, h, _TAU_SPAN.to(h.device), method=self.solver_method, rtol=self.rtol, atol=self.atol)
         return solution[-1]
 
     def _evolve_with_hazard_integral(
@@ -145,53 +153,63 @@ class SurvLatentODEModel(CompassSurvivalModel):
             dcum = hazard_rates * real_years.unsqueeze(-1)
             return torch.cat([dh, dcum], dim=-1)
 
-        solution = odeint(augmented_func, z0, _TAU_SPAN.to(h.device), method=self.solver_method)
+        solution = odeint(augmented_func, z0, _TAU_SPAN.to(h.device), method=self.solver_method, rtol=self.rtol, atol=self.atol)
         z_final = solution[-1]
         h_final = z_final[:, : self.latent_dim]
         cum_hazard = {name: z_final[:, self.latent_dim + i] for i, name in enumerate(OUTCOME_NAMES)}
         return h_final, cum_hazard
 
-    def _integrate_hazard_to(
-        self, h: torch.Tensor, target_days: torch.Tensor
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Evolve h to each patient's own target_days (batch,) -- which can range from a
-        few days to 13 years (capped at the end of the last bin) within one batch (event/censoring times vary enormously per
-        patient) -- and return the cumulative hazard integrated over [0, target_days].
+    def _integrate_hazard_to_targets(
+        self, h: torch.Tensor, targets: dict[str, torch.Tensor]
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """ONE forward integration per batch up to each patient's furthest target, reading
+        each outcome's value at its OWN target. targets: {outcome: (batch,) days from the
+        landmark}. Returns ({outcome: latent state at its target}, {outcome: that outcome's
+        cumulative hazard over [0, its target]}).
 
-        A single _evolve_with_hazard_integral() call scales the vector field by real_days
-        directly; with such a wide range of real_days in one batch, dopri5's SHARED
-        adaptive step schedule cannot resolve all elements at once, and the smallest-
-        magnitude/most extreme elements can blow up numerically (empirically produced
-        cumulative hazards in the millions at random initialization, versus the expected
-        O(1-10) range). Fixed by walking forward in UNIFORM sub-steps (bounded to
-        bin_width_years, the same granularity hazards_at_bins() already uses successfully)
-        instead of one giant heterogeneous-scale jump -- each step's real_days range is
-        [0, bin_width_days], not [0, ~4750], which is numerically well-behaved. Patients
-        who reach their own target_days early get step_days=0 (a true no-op: dh/dtau =
-        0 * f(h) = 0) for remaining steps, so this naturally handles per-patient stopping.
+        The augmented state integrates all three outcomes' hazards together, so one walk
+        serves every outcome (previously one full walk per outcome = 3x the solves).
+
+        Why a walk and not one solve: a single _evolve_with_hazard_integral() call scales
+        the vector field by real_days directly; with targets from a few days to 13 years in
+        one batch, dopri5's SHARED adaptive step schedule cannot resolve all elements at
+        once (empirically: cumulative hazards in the millions at random init). So the walk
+        advances in segments of at most bin_width_years, and each segment also stops exactly
+        at a patient's next not-yet-reached target. Each segment is one shared solve with a
+        per-patient length; patients already past all their targets get length 0 (a true
+        no-op: dh/dtau = 0 * f(h) = 0). Number of solves <= ceil(max target / bin width) +
+        number of outcomes.
         """
+        names = list(targets)
+        target_mat = torch.stack([targets[n] for n in names], dim=1)  # (batch, K) days
         step_days = self.bin_width_years * 365.25
-        n_steps = max(1, int(torch.ceil(target_days.max() / step_days).item()))
+        batch, device = h.shape[0], h.device
+        tol_days = 1e-3
 
-        batch = h.shape[0]
-        device = h.device
-        remaining = target_days.clone()
-        cum_hazard = {name: torch.zeros(batch, device=device) for name in OUTCOME_NAMES}
-        h_at_target = torch.zeros_like(h)
-        reached = torch.zeros(batch, dtype=torch.bool, device=device)
+        t_now = torch.zeros(batch, device=device)
+        cum_total = {name: torch.zeros(batch, device=device) for name in OUTCOME_NAMES}
+        h_at = {n: torch.zeros_like(h) for n in names}
+        cum_at = {n: torch.zeros(batch, device=device) for n in names}
+        done = target_mat <= tol_days  # a zero target: state / cumulative hazard at the landmark
+        for k, n in enumerate(names):
+            h_at[n] = torch.where(done[:, k].unsqueeze(-1), h, h_at[n])
 
-        for _ in range(n_steps):
-            this_step = torch.clamp(remaining, min=0.0, max=step_days)
-            h_new, cum_hazard_step = self._evolve_with_hazard_integral(h, this_step)
+        max_segments = int(torch.ceil(target_mat.max() / step_days).item()) + len(names) + 1
+        for _ in range(max_segments):
+            if bool(done.all()):
+                break
+            next_target = torch.where(done, torch.full_like(target_mat, float("inf")), target_mat).min(dim=1).values
+            seg = torch.where(torch.isinf(next_target), torch.zeros_like(t_now), (next_target - t_now).clamp(0.0, step_days))
+            h, cum_step = self._evolve_with_hazard_integral(h, seg)
             for name in OUTCOME_NAMES:
-                cum_hazard[name] = cum_hazard[name] + cum_hazard_step[name]
-            h = h_new
-            remaining = remaining - this_step
-            newly_reached = (~reached) & (remaining <= 1e-6)
-            h_at_target = torch.where(newly_reached.unsqueeze(-1), h, h_at_target)
-            reached = reached | newly_reached
-
-        return h_at_target, cum_hazard
+                cum_total[name] = cum_total[name] + cum_step[name]
+            t_now = t_now + seg
+            newly = (~done) & (target_mat <= t_now.unsqueeze(1) + tol_days)
+            for k, n in enumerate(names):
+                h_at[n] = torch.where(newly[:, k].unsqueeze(-1), h, h_at[n])
+                cum_at[n] = torch.where(newly[:, k], cum_total[n], cum_at[n])
+            done = done | newly
+        return h_at, cum_at
 
     def encode_trajectory(
         self,

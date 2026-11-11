@@ -56,6 +56,30 @@ def sample_landmark(
     return pd.Timestamp(visit_dates[idx])
 
 
+def first_landmark(patient_visits: pd.DataFrame, *, index_date: pd.Timestamp, death_date: pd.Timestamp) -> pd.Timestamp:
+    """The patient's FIRST valid landmark: the earliest visit on/after index_date and before
+    death_date (landmark_candidate_mask). Raises if there is none."""
+    visit_dates = patient_visits["visit_date"].to_numpy()
+    visit_dates = visit_dates[landmark_candidate_mask(visit_dates, index_date, death_date)]
+    if len(visit_dates) == 0:
+        raise ValueError("first_landmark: no visit on/after index_date and before death_date -- no valid landmark")
+    return pd.Timestamp(visit_dates.min())
+
+
+EVAL_LANDMARK_RULES = ("first_post_index", "random")
+
+
+def select_landmark(
+    patient_visits: pd.DataFrame, rng: np.random.Generator, rule: str, *, index_date: pd.Timestamp, death_date: pd.Timestamp
+) -> pd.Timestamp:
+    """Landmark by rule: "first_post_index" -> first_landmark(); "random" -> sample_landmark()."""
+    if rule == "first_post_index":
+        return first_landmark(patient_visits, index_date=index_date, death_date=death_date)
+    if rule == "random":
+        return sample_landmark(patient_visits, rng, index_date=index_date, death_date=death_date)
+    raise ValueError(f"unknown landmark rule '{rule}' (expected one of {EVAL_LANDMARK_RULES})")
+
+
 def construct_landmark_example(
     patient_visits: pd.DataFrame,
     patient_outcomes: pd.Series,

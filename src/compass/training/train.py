@@ -140,7 +140,9 @@ class Trainer:
             resample_each_epoch=False,
             epoch=0,
             split=split,
+            eval_landmark=training_config.get("evaluation", {}).get("landmark", "first_post_index"),
         )
+        self.eval_landmark = result.eval_landmark
         self.data_fingerprint = data_fingerprint(visits_df, outcomes_df)
         self.scalers = result.scalers
         self.feature_names = result.feature_names
@@ -152,11 +154,11 @@ class Trainer:
         # Fixed eval examples, keyed by patient_id, covering both val and test -- reused by
         # every evaluate(resample_landmarks=False) call across the whole training run.
         self._fixed_eval_examples = {ex["patient_id"]: ex for ex in result.val + result.test}
-        # Fixed (seed-sampled) TRAINING-split landmark examples: never used for training
-        # (training resamples landmarks every epoch) -- only as the evaluation pipeline's
-        # IPCW censoring reference (compass.evaluation.pipeline), which must come from the
-        # training split, never from the split being evaluated.
-        self._fixed_train_examples = list(result.train)
+        # TRAINING-split examples at the EVALUATION landmark rule (same rule as val / test):
+        # never used for training (training resamples random landmarks every epoch) -- only
+        # as the evaluation pipeline's IPCW censoring reference (compass.evaluation.pipeline),
+        # which must come from the training split and use the same landmark rule.
+        self._fixed_train_examples = list(result.train_eval)
 
         # Raw per-patient data, for resampling fresh TRAINING landmarks each epoch (and for
         # evaluate(resample_landmarks=True)'s fresh draws).
@@ -172,9 +174,10 @@ class Trainer:
         self._resume_rng_state = None
 
     def fixed_examples(self, split: str) -> list[dict]:
-        """The split's fixed landmark examples (scaled + masked), in split order.
-        train: the seed-sampled training landmarks (IPCW reference only, see __init__);
-        val / test: the same fixed landmarks evaluate(resample_landmarks=False) uses."""
+        """The split's fixed landmark examples (scaled + masked), in split order, all at the
+        evaluation landmark rule (configs/training.yaml: evaluation.landmark).
+        train: the IPCW reference only (see __init__); val / test: the same fixed landmarks
+        evaluate(resample_landmarks=False) uses."""
         if split == "train":
             return list(self._fixed_train_examples)
         ids = {"val": self.val_ids, "test": self.test_ids}[split]
@@ -274,6 +277,15 @@ class Trainer:
             per_batch.append((self._run_batch(examples, train=False), len(minibatch_ids)))
         return self._average_over_batches(per_batch)
 
+    @staticmethod
+    def _epoch_line(epoch: int, train_metrics: dict, val_metrics: dict, elapsed: float) -> str:
+        """Console line per epoch: total and per-outcome survival NLL (nll_<outcome>) for
+        train and val -- the same values written to training_log.jsonl."""
+        def part(m):
+            per_outcome = " ".join(f"{k[4:]}={m[k]:.4f}" for k in ("nll_mortality", "nll_malo", "nll_cvd") if k in m)
+            return f"total={m['total']:.4f} [{per_outcome}]"
+        return f"  epoch {epoch}: train {part(train_metrics)} | val {part(val_metrics)} | {elapsed:.1f}s"
+
     def _checkpoint(self, path: Path, epoch: int, rng: np.random.Generator, val_loss: float):
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -365,6 +377,7 @@ class Trainer:
 
             with open(log_path, "a") as f:
                 f.write(json.dumps({"epoch": epoch, "train": train_metrics, "val": val_metrics, "elapsed_seconds": elapsed}) + "\n")
+            print(self._epoch_line(epoch, train_metrics, val_metrics, elapsed), flush=True)
 
             val_loss = val_metrics["total"]
             improved = val_loss < best_val_loss

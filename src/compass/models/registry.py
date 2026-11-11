@@ -50,5 +50,7 @@ def build_model(name: str, model_config: dict, num_features: int, horizon_years:
             num_time_bins=model_config["num_time_bins"],
             bin_width_years=model_config["bin_width_years"],
             solver_method=model_config["solver_method"],
+            rtol=float(model_config.get("rtol", 1e-3)),
+            atol=float(model_config.get("atol", 1e-4)),
         )
     raise ValueError(f"unknown model name: {name}")

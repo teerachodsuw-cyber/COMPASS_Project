@@ -232,7 +232,7 @@ def test_no_ranking_loss_term():
         batch[f"{name}_at_risk"] = torch.tensor([1.0, 1.0])
     loss_dict = tracer_survival_loss(hazards, batch)
 
-    assert set(loss_dict.keys()) == {"survival_nll", "total"}
+    assert set(loss_dict.keys()) == {"survival_nll", "total", "nll_mortality", "nll_malo", "nll_cvd"}
     assert torch.allclose(loss_dict["survival_nll"], loss_dict["total"])
 
 

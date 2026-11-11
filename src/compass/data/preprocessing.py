@@ -2,7 +2,9 @@
 correctness:
 
 1. patient_level_split() -> train/val/test patient_ids (no overlap)
-2. sample_landmark() per patient per split
+2. one landmark per patient per split: training = one random valid landmark
+   (sample_landmark); val / test and the training-split IPCW reference = the evaluation rule
+   (default: each patient's FIRST valid landmark, see eval_landmark)
 3. construct_landmark_example() per patient
 4. fit_scalers() using ONLY the training split's observed values
 5. apply_scalers() then apply_masking(), in that order, applied to train/val/test alike
@@ -16,7 +18,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from compass.data.landmarking import construct_landmark_example, death_date_of, sample_landmark
+from compass.data.landmarking import construct_landmark_example, death_date_of, sample_landmark, select_landmark
 from compass.data.masking import apply_masking
 from compass.data.scaling import apply_scalers, fit_scalers
 from compass.data.splitting import patient_level_split
@@ -140,6 +142,11 @@ class PreprocessedData:
     patient_id, landmark_date, input_visits (raw), input_values (scaled/encoded +
     zero-filled, columns in feature_names order), input_mask (1=observed/0=missing, same
     column order). No outcome labels: targets come from compass.training.targets.build_targets.
+
+    train: one random valid landmark per training patient (also what the scalers are fit on).
+    val / test: the evaluation landmark rule (eval_landmark).
+    train_eval: the TRAINING split at the evaluation landmark rule -- the IPCW censoring
+      reference for evaluation, built with the same rule as the evaluated split.
     """
 
     train: list[dict]
@@ -149,6 +156,8 @@ class PreprocessedData:
     continuous_columns: list[str]
     feature_names: list[str]
     horizons: list[int]
+    train_eval: list[dict]
+    eval_landmark: str
 
 
 def run_preprocessing(
@@ -166,6 +175,7 @@ def run_preprocessing(
     resample_each_epoch: bool = False,
     epoch: int = 0,
     split: dict | None = None,
+    eval_landmark: str = "first_post_index",
 ) -> PreprocessedData:
     """Run the full pipeline once and return a PreprocessedData bundle.
 
@@ -177,6 +187,11 @@ def run_preprocessing(
 
     split: a pinned split {"train": ids, "val": ids, "test": ids} (e.g. loaded from a run's
     split.json at evaluation) -- used as-is instead of re-deriving it with patient_level_split.
+
+    eval_landmark (configs/training.yaml: evaluation.landmark): the landmark rule for val /
+    test and for train_eval (the IPCW reference). "first_post_index" (default) = each
+    patient's FIRST visit on/after index_date and before death; "random" = one random valid
+    visit (seeded). Training examples always use one random valid landmark.
     """
     if split is not None:
         train_ids, val_ids, test_ids = list(split["train"]), list(split["val"]), list(split["test"])
@@ -190,22 +205,24 @@ def run_preprocessing(
         pid: group.sort_values("visit_date").reset_index(drop=True) for pid, group in visits_df.groupby("patient_id")
     }
 
-    def _build_examples(patient_ids: list, landmark_seed: int) -> list[dict]:
+    def _build_examples(patient_ids: list, landmark_seed: int, rule: str) -> list[dict]:
         rng = np.random.default_rng(landmark_seed)
         examples = []
         for pid in patient_ids:
             patient_visits = visits_by_patient[pid]
             patient_outcomes = outcomes_indexed.loc[pid]
-            landmark_date = sample_landmark(
-                patient_visits, rng, index_date=patient_outcomes["index_date"], death_date=death_date_of(patient_outcomes)
+            landmark_date = select_landmark(
+                patient_visits, rng, rule,
+                index_date=patient_outcomes["index_date"], death_date=death_date_of(patient_outcomes),
             )
             examples.append(construct_landmark_example(patient_visits, patient_outcomes, landmark_date))
         return examples
 
     train_landmark_seed = seed + epoch if resample_each_epoch else seed
-    train_examples = _build_examples(train_ids, train_landmark_seed)
-    val_examples = _build_examples(val_ids, seed + 100_000)
-    test_examples = _build_examples(test_ids, seed + 200_000)
+    train_examples = _build_examples(train_ids, train_landmark_seed, "random")
+    val_examples = _build_examples(val_ids, seed + 100_000, eval_landmark)
+    test_examples = _build_examples(test_ids, seed + 200_000, eval_landmark)
+    train_eval_examples = _build_examples(train_ids, seed + 300_000, eval_landmark)
 
     train_visits_concat = pd.concat([ex["input_visits"] for ex in train_examples], ignore_index=True)
     train_mask_df = train_visits_concat[continuous_columns].notna().astype(int)
@@ -217,6 +234,8 @@ def run_preprocessing(
         train=scale_and_mask_examples(train_examples, scalers, continuous_columns, medication_columns, sex_categories, smoking_status_categories, feature_names),
         val=scale_and_mask_examples(val_examples, scalers, continuous_columns, medication_columns, sex_categories, smoking_status_categories, feature_names),
         test=scale_and_mask_examples(test_examples, scalers, continuous_columns, medication_columns, sex_categories, smoking_status_categories, feature_names),
+        train_eval=scale_and_mask_examples(train_eval_examples, scalers, continuous_columns, medication_columns, sex_categories, smoking_status_categories, feature_names),
+        eval_landmark=eval_landmark,
         scalers=scalers,
         continuous_columns=list(continuous_columns),
         feature_names=feature_names,
