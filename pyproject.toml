@@ -20,6 +20,7 @@ dependencies = [
     "scikit-survival",
     "comprisk",
     "pyarrow",
+    "python-docx",
 ]
 
 [project.optional-dependencies]
