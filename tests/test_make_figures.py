@@ -283,3 +283,49 @@ def test_include_baseline_draws_the_grey_baseline_row(synthetic_outputs, tmp_pat
     base["n_patients"] += 1
     with pytest.raises(figures.FigureDataError, match="n_patients"):
         figures.merge_baseline_rows(results, base)
+
+
+def _synthetic_importance() -> dict:
+    """An importance.json-shaped dict (scripts/feature_importance.py) with random values."""
+    from compass.evaluation.importance import GROUPS, VARIABLE_LABEL
+    rng = np.random.default_rng(9)
+    preds = ["dynamic_deephit", "tracer", "survlatent_ode", "cox_baseline"]
+
+    def rows(units, kind):
+        out = []
+        for u, label in units:
+            for p in preds:
+                for o in ("mortality", "malo", "cvd"):
+                    d = rng.normal(rng.uniform(-0.002, 0.03), 0.004, 10)
+                    out.append({"kind": kind, "unit": u, "label": label, "predictor": p, "outcome": o, "c_unpermuted": 0.75,
+                                "mean_drop": float(d.mean()), "p2_5": float(np.percentile(d, 2.5)),
+                                "p97_5": float(np.percentile(d, 97.5)), "drops": d.tolist()})
+        return out
+
+    return {"horizon_years": 10, "n_repeats": 10,
+            "individual": rows(list(VARIABLE_LABEL.items()), "variable"), "grouped": rows([(g, g) for g in GROUPS], "group")}
+
+
+def test_fig6_and_s5_plot_the_importance_json_exactly(tmp_path):
+    import matplotlib.pyplot as plt
+    plt.rcParams.update(figures.STYLE)
+    res = _synthetic_importance()
+    for kind, top_n, n_units in (("grouped", None, 9), ("individual", 15, 15)):
+        fig = figures.fig_importance(res, kind, top_n)
+        assert figures.check_importance_plotted(fig, res, kind, top_n) == 3 * n_units * 4
+        assert figures.text_problems(fig) == []
+        for ax, o in zip(fig.axes, ("mortality", "malo", "cvd")):  # rows top-down = descending mean across predictors
+            labels = [t.get_text() for t in ax.get_yticklabels()]
+            order = figures.importance_order(res[kind], o, top_n)
+            label_of = {r["unit"]: r["label"] for r in res[kind]}
+            assert labels == [label_of[u] for u in order]
+            means = [np.mean([r["mean_drop"] for r in res[kind] if r["unit"] == u and r["outcome"] == o]) for u in order]
+            assert means == sorted(means, reverse=True)
+        assert any(figures.IMPORTANCE_FOOTNOTE in t.get_text() for t in fig.texts)
+        tampered = json.loads(json.dumps(res))
+        tampered[kind][0]["p97_5"] += 1e-12
+        if (tampered[kind][0]["outcome"], tampered[kind][0]["unit"]) in {(o, u) for o in ("mortality", "malo", "cvd")
+                                                                          for u in figures.importance_order(res[kind], o, top_n)}:
+            with pytest.raises(figures.FigureDataError):
+                figures.check_importance_plotted(fig, tampered, kind, top_n)
+        plt.close(fig)

@@ -9,7 +9,7 @@ Usage:
         --band-assignments runs/final_test/band_assignments.csv [--include-baseline]
     # final version (Fig 2 / S3 with the baseline row, plus Fig 5):
     python scripts/make_figures.py --include-baseline --baseline-eval-dir outputs/baseline_test \\
-        --serial-dir outputs/serial_test --serial-val-dir outputs/serial_val
+        --serial-dir outputs/serial_test --serial-val-dir outputs/serial_val --importance-dir outputs/importance
 
 Inputs:
 - <eval-dir>/metrics.json (scripts/evaluate.py): C-index / IBS with bootstrap CIs, pairwise
@@ -35,6 +35,10 @@ every plotted estimate / CI is read back and must equal the baseline JSON.
 (--final) and validation metrics.json: the two runs must share models, checkpoints, settings and the
 landmark Cox fit (fitted on validation, reused on test); every plotted estimate / CI is read back
 from the figure and must equal the test JSON exactly.
+--importance-dir adds fig6_importance_grouped and figS5_importance_top15 from
+scripts/feature_importance.py's importance.json (mean drop and 2.5-97.5 percentile range per
+predictor; rows ordered by the mean across the four predictors); every plotted value is read back
+and must equal the JSON exactly.
 Fig 4 curves stop at the last time with >= 10 patients at risk in that band (the full curves are
 still checked against the saved 10-yr observed risks); numbers-at-risk tables are not truncated.
 
@@ -713,6 +717,113 @@ def check_baseline_diff_plotted(fig, baseline: dict) -> int:
     return len(expected)
 
 
+# ---- Fig 6 / S5: permutation importance -----------------------------------------------------
+
+IMPORTANCE_PREDICTORS = MODELS + ("cox_baseline",)
+IMPORTANCE_TOP_N = 15
+IMPORTANCE_FOOTNOTE = ("Permutation importance: decrease in C-index when the variable (or group) is randomly shuffled across "
+                       "patients; reflects predictive reliance, not causal effect.")
+
+
+def importance_order(rows: list[dict], outcome: str, top_n: int | None = None) -> list[str]:
+    """Units for one outcome, highest mean importance (averaged over the four predictors)
+    first; ties by name. top_n keeps the first n."""
+    by_unit = {}
+    for r in rows:
+        if r["outcome"] == outcome:
+            by_unit.setdefault(r["unit"], []).append(r["mean_drop"])
+    order = sorted(by_unit, key=lambda u: (-float(np.mean(by_unit[u])), u))
+    return order[:top_n] if top_n else order
+
+
+def fig_importance(results: dict, kind: str, top_n: int | None = None):
+    """Three stacked panels (mortality, MALO, CVD): one row per group (kind "grouped") or per
+    variable (kind "individual", top_n per outcome), the four predictors dodged; point = mean
+    drop over the repeats, bar = 2.5-97.5 percentile range. Artists carry gids
+    ("pe|outcome|unit|predictor", "ci|...") for check_importance_plotted."""
+    rows = results[kind]
+    labels = {r["unit"]: r["label"] for r in rows}
+    idx = {(r["outcome"], r["unit"], r["predictor"]): r for r in rows}
+    orders = {o: importance_order(rows, o, top_n) for o in OUTCOMES}
+    n_rows = max(len(v) for v in orders.values())
+    row_h = 4.6 if n_rows <= 10 else 3.8
+    W, left, right = 174, 44, 4
+    panel_h, title_h, xlab_h, top_h, foot_h = n_rows * row_h + 2, 6, 11, 12, 15
+    H = top_h + 3 * (title_h + panel_h + xlab_h) + foot_h
+    fig = plt.figure(figsize=(W * MM, H * MM))
+    offsets = dict(zip(IMPORTANCE_PREDICTORS, np.linspace(0.27, -0.27, len(IMPORTANCE_PREDICTORS))))
+    letters = iter("ABC")
+    for i, o in enumerate(OUTCOMES):
+        bottom = H - top_h - (i + 1) * (title_h + panel_h + xlab_h) + xlab_h
+        ax = fig.add_axes([left / W, bottom / H, (W - left - right) / W, panel_h / H])
+        units = orders[o]
+        ys = np.arange(len(units))[::-1].astype(float) + (n_rows - len(units))  # top-aligned
+        lo_all, hi_all = [0.0], [0.0]
+        for y, u in zip(ys, units):
+            for pred in IMPORTANCE_PREDICTORS:
+                r = idx.get((o, u, pred))
+                if r is None:
+                    continue
+                st = MODEL_STYLE[pred]
+                yy = y + offsets[pred]
+                ax.hlines(yy, r["p2_5"], r["p97_5"], color=st["color"], lw=1.0, zorder=3, gid=f"ci|{o}|{u}|{pred}")
+                ax.plot([r["mean_drop"]], [yy], ls="none", marker=st["marker"], ms=3.6, color=st["color"], zorder=4,
+                        gid=f"pe|{o}|{u}|{pred}")
+                lo_all.append(r["p2_5"])
+                hi_all.append(r["p97_5"])
+        span = max(hi_all) - min(lo_all)
+        ax.set_xlim(min(lo_all) - 0.06 * span - 1e-4, max(hi_all) + 0.06 * span + 1e-4)
+        ax.axvline(0, color=REF_GREY, ls="--", lw=0.8, zorder=1)
+        ax.set_ylim(-0.6, n_rows - 0.4)
+        ax.set_yticks(ys, [labels[u] for u in units])
+        ax.set_xlabel(f"Decrease in C-index ({CINDEX_LABEL[o].split('(')[1]}", labelpad=2)
+        ax.set_title(OUTCOME_LABEL[o], loc="left", fontweight="bold")
+        _style_axes(ax, "x")
+        fig.text(2 / W, (bottom + panel_h + 1.5) / H, next(letters), fontsize=14, fontweight="bold", ha="left", va="bottom")
+    handles = [Line2D([], [], color=MODEL_STYLE[p]["color"], marker=MODEL_STYLE[p]["marker"], ls="-", lw=1.0, ms=3.6,
+                      label=MODEL_STYLE[p]["label"]) for p in IMPORTANCE_PREDICTORS]
+    handles.append(Line2D([], [], color=REF_GREY, ls="--", lw=0.8, label="No reliance (0)"))
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 1 - 1 / H), ncol=len(handles), fontsize=7,
+               columnspacing=1.3, handlelength=2.0, borderaxespad=0)
+    what = ("groups shuffled jointly with one shared permutation; rows ordered by mean importance across the four predictors"
+            if kind == "grouped" else
+            f"top {top_n} variables per outcome by mean importance across the four predictors; smoking status: its three "
+            "indicators shuffled together")
+    notes = [IMPORTANCE_FOOTNOTE,
+             (f"Test split, first valid landmark, {int(results['horizon_years'])}-yr horizon; points: mean over "
+              f"{int(results['n_repeats'])} permutations; bars: 2.5–97.5 percentile range across permutations;"),
+             f"{what}."]
+    fig.text(0.5, 1.5 / H, "\n".join(notes), ha="center", va="bottom", fontsize=6.5, linespacing=1.35)
+    return fig
+
+
+def check_importance_plotted(fig, results: dict, kind: str, top_n: int | None = None) -> int:
+    """Every plotted mean / range equals the JSON exactly, the plotted units are the expected
+    (ordered, top-n) ones, and nothing else is plotted. Returns the number of points checked."""
+    rows = results[kind]
+    idx = {(r["outcome"], r["unit"], r["predictor"]): r for r in rows}
+    expected = {(o, u, p) for o in OUTCOMES for u in importance_order(rows, o, top_n) for p in IMPORTANCE_PREDICTORS
+                if (o, u, p) in idx}
+    seen = {}
+    for ax in fig.axes:
+        for line in ax.lines:
+            gid = line.get_gid() or ""
+            if gid.startswith("pe|"):
+                seen.setdefault(tuple(gid.split("|")[1:]), {})["pe"] = float(line.get_xdata()[0])
+        for coll in ax.collections:
+            gid = coll.get_gid() or ""
+            if gid.startswith("ci|"):
+                seg = coll.get_segments()[0]
+                seen.setdefault(tuple(gid.split("|")[1:]), {})["ci"] = (float(seg[0][0]), float(seg[1][0]))
+    if set(seen) != expected:
+        raise FigureDataError(f"importance ({kind}): plotted units differ from the JSON's ordered selection")
+    for key in expected:
+        r = idx[key]
+        if seen[key].get("pe") != r["mean_drop"] or seen[key].get("ci") != (r["p2_5"], r["p97_5"]):
+            raise FigureDataError(f"importance ({kind}): plotted value differs from the JSON for {key}")
+    return len(expected)
+
+
 # ---- Fig 5: serial evaluation (secondary analysis 2) ----------------------------------------
 
 SERIAL_FULL = tuple(f"{m}_full" for m in MODELS)
@@ -907,7 +1018,7 @@ def merge_baseline_rows(results: dict, baseline_results: dict) -> dict:
 
 
 def make_all(eval_dir, out_dir, flow_path, split_path, assignments_path, include_baseline: bool = False,
-             baseline_eval_dir=None, serial_dir=None, serial_val_dir=None) -> list[Path]:
+             baseline_eval_dir=None, serial_dir=None, serial_val_dir=None, importance_dir=None) -> list[Path]:
     serial = None
     if serial_dir:
         if not serial_val_dir:
@@ -942,6 +1053,13 @@ def make_all(eval_dir, out_dir, flow_path, split_path, assignments_path, include
         fig = fig_serial(serial)
         check_serial_plotted(fig, serial)
         paths += save(fig, out_dir, "fig5_serial_evaluation")
+    if importance_dir:
+        importance = json.loads((Path(importance_dir) / "importance.json").read_text())
+        for kind, top_n, name in (("grouped", None, "fig6_importance_grouped"),
+                                  ("individual", IMPORTANCE_TOP_N, "figS5_importance_top15")):
+            fig = fig_importance(importance, kind, top_n)
+            check_importance_plotted(fig, importance, kind, top_n)
+            paths += save(fig, out_dir, name)
     return paths
 
 
@@ -956,10 +1074,12 @@ def main(argv=None) -> int:
     p.add_argument("--baseline-eval-dir", default=None, help="Evaluation dir holding the cox_baseline results.")
     p.add_argument("--serial-dir", default=None, help="Serial evaluation test run (scripts/serial_evaluate.py --final) -> Fig 5.")
     p.add_argument("--serial-val-dir", default=None, help="Serial evaluation validation run (checked against the test run).")
+    p.add_argument("--importance-dir", default=None, help="scripts/feature_importance.py output -> Fig 6 and S5.")
     args = p.parse_args(argv)
     try:
         paths = make_all(args.eval_dir, args.out_dir, args.flow, args.split_file, args.band_assignments,
-                         args.include_baseline, args.baseline_eval_dir, args.serial_dir, args.serial_val_dir)
+                         args.include_baseline, args.baseline_eval_dir, args.serial_dir, args.serial_val_dir,
+                         args.importance_dir)
     except FigureDataError as exc:
         print(f"refusing: {exc}", file=sys.stderr)
         return 3
