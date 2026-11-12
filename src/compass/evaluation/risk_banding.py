@@ -1,188 +1,299 @@
-"""Convert continuous predicted risk scores into discrete clinical bands (e.g.
-low/intermediate/high) via outcome-optimized cutpoint search.
+"""Three risk bands (low / intermediate / high) per model and outcome from the predicted 10-yr
+risk, with two cut-points chosen on the VALIDATION split and then applied unchanged to any
+later split. Aggregates only.
 
-Test choice per outcome:
-- mortality has no competing risk here -> log-rank test (lifelines.statistics.logrank_test).
-- malo/cvd have mortality as a competing risk -> log-rank is WRONG (it treats death as
-  independent censoring and biases the comparison); Gray's test (Gray, Annals of Statistics
-  1988;16(3):1141-1154) is the correct K-sample test for comparing cumulative incidence
-  functions in the presence of a competing risk.
+FIT (validation split only -- fit_band_cutpoints / fit_all_cutpoints):
+- candidates: the predicted-risk percentiles 10, 11, ..., 90 of the fitting sample (unique
+  values); every pair c1 < c2 is tried.
+- bands: low = risk <= c1, intermediate = c1 < risk <= c2, high = risk > c2 (assign_bands).
+- a pair is eligible only if each band holds >= min_band_fraction (default 10%) of patients.
+- the eligible pair with the largest 3-group test statistic wins:
+    mortality (no competing risk): log-rank (lifelines.statistics.multivariate_logrank_test);
+    MALO / CVD (death competes): Gray's K-sample test (comprisk.gray_test), which compares
+    cumulative incidence functions with death as a competing event. Log-rank would treat
+    competing deaths as independent censoring -- wrong for these outcomes. comprisk's Gray's
+    test matches R's cmprsk::cuminc to 1e-9 (tests/test_r_reference_fixtures.py).
+  Ties in the statistic: the first pair in (c1, c2) order wins (deterministic).
+- no eligible pair -> NoValidCutpointsError (never a silent fallback to another rule).
+- an outcome with zero events in the fitting sample has no separation to maximise: it is
+  recorded as not fitted (status in cutpoints.json, "n/a" in the tables), not banded by a
+  substitute rule.
+- the reported p-value is that of the WINNING pair, i.e. after searching many pairs: it is
+  optimistic and not a valid test of association.
 
-GRAY'S TEST: neither lifelines nor scikit-survival (already project dependencies)
-implements Gray's test -- confirmed by checking their APIs directly (lifelines.statistics
-has only logrank_test/multivariate_logrank_test; sksurv.compare.compare_survival's own
-docstring states it is "the log-rank test"). Uses comprisk.gray_test (PyPI package
-`comprisk`) instead of a hand-rolled implementation: an investigation session found
-comprisk's Gray's test independently matches R's cmprsk::cuminc (Gray's own reference
-implementation) to 1e-9/1e-10 absolute tolerance on real R-generated fixtures (see
-tests/fixtures/gray_test_r_reference.csv and tests/test_r_reference_fixtures.py, generated
-once via a local R install -- R is NOT a runtime dependency of this project). An earlier
-hand-rolled version of this file used an approximate (hypergeometric-style) variance formula
-that reached the same qualitative conclusions but a meaningfully different magnitude on the
-same data (46.4 vs comprisk's 19.28) -- replaced rather than kept, since comprisk's is the
-independently-verified one.
+APPLY (any split): assign_bands(scores, saved cut-points) never looks at outcomes or at the
+distribution of the scores it is given; evaluate.py loads cutpoints.json for the test split
+and never calls a fit function there.
 
-CRITICAL: cutpoints must be FIT on train+val data only, then APPLIED (never re-derived) to
-test data. find_optimal_cutpoint_logrank/_gray and fit_quantile_boundaries are the only
-functions that look at data to choose a cutpoint -- they are the FIT step and must only ever
-be called on train+val. apply_cutpoint/apply_quantile_bands are pure application (score in,
-band out) and are safe to call on any split, including test.
+Follow-up is truncated at the horizon for both the search and the band summaries (later
+times -> horizon, later events -> censored), so bands are compared on the same 10-yr window
+the predicted risk refers to.
+
+Per band (band_summary): n, events within the horizon, observed 10-yr risk (Kaplan-Meier for
+mortality, Aalen-Johansen with death competing for MALO / CVD), and hazard ratios vs the low
+band: Cox for mortality, CAUSE-SPECIFIC Cox for MALO / CVD (competing deaths censored), so
+the MALO / CVD HRs are cause-specific hazard ratios, not subdistribution HRs.
 """
+
+import json
+import math
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from comprisk.gray_test import gray_test
 from lifelines import CoxPHFitter
-from lifelines.statistics import logrank_test
+from lifelines.exceptions import ConvergenceError
+from lifelines.statistics import multivariate_logrank_test
+
+from compass.evaluation.calibration import at_risk_horizon_data, estimator_name, observed_risk
+from compass.models.base import DEATH_OUTCOME, OUTCOME_NAMES
+
+BAND_NAMES = ("low", "intermediate", "high")
+DEFAULT_PERCENTILES = tuple(range(10, 91))
+DEFAULT_MIN_BAND_FRACTION = 0.10
+CUTPOINTS_FILE = "cutpoints.json"
 
 
-def _candidate_cutpoints(scores: np.ndarray, candidate_quantile_range: tuple) -> np.ndarray:
-    lo, hi = candidate_quantile_range
-    quantiles = np.linspace(lo, hi, 50)
-    return np.unique(np.quantile(scores, quantiles))
+class NoValidCutpointsError(ValueError):
+    """No pair of candidate cut-points gives three bands that each meet the minimum size."""
 
 
-def find_optimal_cutpoint_logrank(
-    scores: np.ndarray,
-    event_indicator: np.ndarray,
-    event_time: np.ndarray,
-    candidate_quantile_range: tuple = (0.1, 0.9),
-) -> dict:
-    """FIT step, no competing risk (mortality). Scans candidate cutpoints across
-    candidate_quantile_range of `scores`, computes a log-rank statistic for each candidate
-    2-group split (score > cutpoint vs <=), returns the cutpoint that MAXIMIZES the log-rank
-    chi-square statistic, with its statistic and p-value.
-
-    Only ever call this on train+val data -- see module docstring.
-    """
-    best = {"cutpoint": None, "statistic": -np.inf, "p_value": None}
-    for cp in _candidate_cutpoints(scores, candidate_quantile_range):
-        high = scores > cp
-        if high.sum() == 0 or (~high).sum() == 0:
-            continue
-        result = logrank_test(
-            event_time[high], event_time[~high],
-            event_observed_A=event_indicator[high], event_observed_B=event_indicator[~high],
-        )
-        if result.test_statistic > best["statistic"]:
-            best = {"cutpoint": float(cp), "statistic": float(result.test_statistic), "p_value": float(result.p_value)}
-    return best
+class CutpointsMismatchError(ValueError):
+    """Saved cut-points do not belong to this evaluation (split, data, horizon or models)."""
 
 
-def find_optimal_cutpoint_gray(
-    scores: np.ndarray,
-    event_indicator: np.ndarray,
-    event_time: np.ndarray,
-    competing_event_indicator: np.ndarray,
-    candidate_quantile_range: tuple = (0.1, 0.9),
-) -> dict:
-    """FIT step, for outcomes with a competing risk (malo/cvd, mortality competing). Same
-    scanning approach as find_optimal_cutpoint_logrank, but using comprisk's Gray's test
-    (see module docstring) instead of log-rank.
-
-    competing_event_indicator: 1 for patients who experienced the competing event
-    (mortality) rather than the outcome of interest.
-
-    Only ever call this on train+val data -- see module docstring.
-    """
-    event_code = np.where(event_indicator.astype(bool), 1, np.where(competing_event_indicator.astype(bool), 2, 0))
-
-    best = {"cutpoint": None, "statistic": -np.inf, "p_value": None}
-    for cp in _candidate_cutpoints(scores, candidate_quantile_range):
-        group = (scores > cp).astype(int)
-        if group.sum() == 0 or (group == 0).sum() == 0:
-            continue
-        result = gray_test(event_time, event_code, group, cause=1)
-        if result.stat > best["statistic"]:
-            best = {"cutpoint": float(cp), "statistic": float(result.stat), "p_value": float(result.pvalue)}
-    return best
+def separation_test_name(outcome: str) -> str:
+    return "log-rank" if outcome == DEATH_OUTCOME else "Gray"
 
 
-def apply_cutpoint(scores: np.ndarray, cutpoint: float) -> np.ndarray:
-    """APPLY step: assign each score to band 0 (<=cutpoint) or 1 (>cutpoint), using an
-    ALREADY-FIT cutpoint. Never re-derives the cutpoint from `scores` -- safe to call on
-    any split (train, val, or test).
-    """
-    return (np.asarray(scores) > cutpoint).astype(int)
+def hazard_ratio_label(outcome: str) -> str:
+    return "Cox" if outcome == DEATH_OUTCOME else "cause-specific Cox"
 
 
-def fit_quantile_boundaries(scores: np.ndarray, n_bands: int = 3) -> np.ndarray:
-    """FIT step for the outcome-blind fallback: n_bands-1 quantile boundaries of `scores`.
-    Uses no outcome information at all (unlike find_optimal_cutpoint_*), but should still
-    be fit on train+val and applied (via apply_quantile_bands) to test for consistency.
-    """
-    quantiles = np.linspace(0.0, 1.0, n_bands + 1)[1:-1]
-    return np.quantile(scores, quantiles)
+def truncate_at_horizon(time, event_type, horizon: float) -> tuple[np.ndarray, np.ndarray]:
+    time = np.asarray(time, dtype=float)
+    event_type = np.asarray(event_type).astype(int)
+    return np.minimum(time, float(horizon)), np.where(time > horizon, 0, event_type)
 
 
-def apply_quantile_bands(scores: np.ndarray, boundaries: np.ndarray) -> np.ndarray:
-    """APPLY step: assign each score to a band index [0, len(boundaries)] using
-    already-fit boundaries."""
-    return np.digitize(scores, boundaries, right=True)
+def assign_bands(scores, cutpoints) -> np.ndarray:
+    """APPLY step: band index per score (0 low, 1 intermediate, 2 high) from ALREADY-FITTED
+    cut-points (c1, c2). Uses nothing but the scores and the two values -- safe on any split."""
+    c1, c2 = (float(c) for c in cutpoints)
+    if not c1 < c2:
+        raise ValueError(f"cut-points must be increasing, got {c1}, {c2}")
+    return np.digitize(np.asarray(scores, dtype=float), [c1, c2], right=True)
 
 
-def assign_quantile_bands(scores: np.ndarray, n_bands: int = 3) -> np.ndarray:
-    """Convenience: fit_quantile_boundaries + apply_quantile_bands on the SAME `scores` in
-    one call. Fine for this simple outcome-blind fallback (no outcome information is used,
-    so there is no train/test leakage risk in the same sense as the outcome-optimized
-    methods) -- for strict pipeline use, prefer fitting boundaries once on train+val and
-    reusing them via apply_quantile_bands on other splits.
-    """
-    boundaries = fit_quantile_boundaries(scores, n_bands)
-    return apply_quantile_bands(scores, boundaries)
+def _statistic(time, event_type, bands, outcome: str) -> tuple[float, float]:
+    if outcome == DEATH_OUTCOME:
+        r = multivariate_logrank_test(time, bands, event_type == 1)
+        return float(r.test_statistic), float(r.p_value)
+    r = gray_test(time, event_type, bands, cause=1)
+    return float(r.stat), float(r.pvalue)
 
 
-def is_outcome_optimized_reliable(event_indicator: np.ndarray, min_events_per_candidate_band: int = 15) -> bool:
-    """Whether there are enough events to trust an outcome-optimized cutpoint search for
-    this outcome, vs. falling back to the outcome-blind quantile method.
+def fit_band_cutpoints(scores, time, event_type, outcome: str, horizon: float,
+                       percentiles=DEFAULT_PERCENTILES, min_band_fraction: float = DEFAULT_MIN_BAND_FRACTION) -> dict:
+    """FIT step (validation split only): the two cut-points maximising the 3-group separation
+    (log-rank for mortality, Gray's test for MALO / CVD), each band >= min_band_fraction of
+    patients. scores: predicted risk at the horizon; time (years), event_type (1 / 2 / 0):
+    at-risk rows. Raises NoValidCutpointsError if no pair is eligible."""
+    scores = np.asarray(scores, dtype=float)
+    time, event_type = truncate_at_horizon(time, event_type, horizon)
+    n = scores.size
+    min_n = math.ceil(min_band_fraction * n)
+    candidates = np.unique(np.quantile(scores, np.asarray(percentiles, dtype=float) / 100.0))
 
-    min_events_per_candidate_band=15 is a judgment call, not an established universal rule.
-    Reasoning: the classic Peduzzi et al. (1996, J Clin Epidemiol) "events per variable"
-    (EPV) guideline for stable Cox regression coefficients recommends >=10 events per
-    estimated parameter -- directly relevant here since compute_band_hazard_ratios() fits a
-    Cox model with band membership as a categorical predictor. On top of that baseline,
-    Altman et al. (1994, BMJ) document that OPTIMAL cutpoint search itself (scanning many
-    candidates and picking the best-separating one, exactly what find_optimal_cutpoint_*
-    does) inflates false-positive/overfitting risk beyond fitting a single pre-specified
-    cutpoint -- worse with fewer events. 15 is a modest safety margin (10 -> 15) added
-    specifically for that extra risk, applied per resulting band (2 bands from one
-    cutpoint), not a number taken directly from either paper.
-    """
-    total_events = int(event_indicator.astype(bool).sum())
-    return total_events >= 2 * min_events_per_candidate_band
+    best, n_eligible = None, 0
+    for i, c1 in enumerate(candidates):
+        for c2 in candidates[i + 1:]:
+            bands = assign_bands(scores, (c1, c2))
+            counts = np.bincount(bands, minlength=3)
+            if counts.min() < min_n:
+                continue
+            n_eligible += 1
+            stat, p = _statistic(time, event_type, bands, outcome)
+            if np.isfinite(stat) and (best is None or stat > best["statistic"]):
+                best = {"cutpoints": [float(c1), float(c2)], "statistic": stat, "p_value": p,
+                        "band_counts": [int(c) for c in counts]}
+    if best is None:
+        raise NoValidCutpointsError(
+            f"{outcome}: no pair of the {candidates.size} candidate cut-points (percentiles "
+            f"{min(percentiles)}-{max(percentiles)}) gives three bands of >= {min_band_fraction:.0%} of {n} patients")
+    return {
+        "status": "fitted",
+        "cutpoints": best["cutpoints"],
+        "test": separation_test_name(outcome),
+        "statistic": best["statistic"],
+        "p_value_after_search": best["p_value"],
+        "n_fit": int(n),
+        "n_events_fit": int((event_type == 1).sum()),
+        "band_fractions_fit": [c / n for c in best["band_counts"]],
+        "n_candidates": int(candidates.size),
+        "n_pairs_eligible": int(n_eligible),
+    }
 
 
-def compute_band_hazard_ratios(band_assignment: np.ndarray, event_indicator: np.ndarray, event_time: np.ndarray, reference_band) -> pd.DataFrame:
-    """Fit a Cox model (lifelines CoxPHFitter) with band membership as a categorical
-    predictor, `reference_band` as the reference category (HR=1.0 by definition). Returns a
-    DataFrame with one row per non-reference band: [band, hazard_ratio, ci_lower, ci_upper].
-    """
-    df = pd.DataFrame(
-        {
-            "duration": event_time,
-            "event": event_indicator.astype(bool),
-            "band": pd.Categorical(band_assignment),
-        }
-    )
-    df["band"] = df["band"].cat.reorder_categories(
-        [reference_band] + [b for b in sorted(df["band"].cat.categories) if b != reference_band]
-    )
-    dummies = pd.get_dummies(df["band"], prefix="band", drop_first=True)
-    cox_df = pd.concat([df[["duration", "event"]], dummies], axis=1)
+def band_hazard_ratios(bands, time, event_type, outcome: str) -> list[dict]:
+    """HR (95% CI) of the intermediate and high bands vs the low band: Cox (mortality) or
+    cause-specific Cox (MALO / CVD: competing deaths censored). time / event_type already
+    truncated at the horizon. A band with no events, or a fit that does not converge, gives
+    NaN with the reason -- never a silently substituted estimate."""
+    bands = np.asarray(bands)
+    event = (np.asarray(event_type) == 1).astype(int)
+    label = hazard_ratio_label(outcome)
+    nan_rows = lambda reason: [{"band": BAND_NAMES[b], "hazard_ratio": float("nan"), "ci_lower": float("nan"),
+                                "ci_upper": float("nan"), "model": label, "note": reason} for b in (1, 2)]
+    events_per_band = [int(event[bands == b].sum()) for b in range(3)]
+    if min(events_per_band) == 0:
+        return nan_rows("not estimable: a band has no events")
+    df = pd.DataFrame({"duration": np.asarray(time, dtype=float), "event": event,
+                       "intermediate": (bands == 1).astype(int), "high": (bands == 2).astype(int)})
+    try:
+        cph = CoxPHFitter().fit(df, duration_col="duration", event_col="event")
+    except ConvergenceError:
+        return nan_rows("Cox fit did not converge")
+    s = cph.summary
+    return [{"band": BAND_NAMES[b], "hazard_ratio": float(s.loc[col, "exp(coef)"]),
+             "ci_lower": float(s.loc[col, "exp(coef) lower 95%"]), "ci_upper": float(s.loc[col, "exp(coef) upper 95%"]),
+             "model": label, "note": ""} for b, col in ((1, "intermediate"), (2, "high"))]
 
-    cph = CoxPHFitter()
-    cph.fit(cox_df, duration_col="duration", event_col="event")
 
-    summary = cph.summary
+def band_summary(scores, cutpoints, time, event_type, outcome: str, horizon: float) -> list[dict]:
+    """Per band: n, fraction, events within the horizon, competing deaths within the horizon
+    (MALO / CVD), observed horizon risk (KM / Aalen-Johansen), and HR vs low (low = 1)."""
+    time, event_type = truncate_at_horizon(time, event_type, horizon)
+    bands = assign_bands(scores, cutpoints)
+    hrs = {r["band"]: r for r in band_hazard_ratios(bands, time, event_type, outcome)}
+    n = bands.size
     rows = []
-    for dummy_col in dummies.columns:
-        band_value = dummy_col.replace("band_", "")
-        rows.append(
-            {
-                "band": band_value,
-                "hazard_ratio": float(summary.loc[dummy_col, "exp(coef)"]),
-                "ci_lower": float(summary.loc[dummy_col, "exp(coef) lower 95%"]),
-                "ci_upper": float(summary.loc[dummy_col, "exp(coef) upper 95%"]),
-            }
-        )
-    return pd.DataFrame(rows)
+    for b, name in enumerate(BAND_NAMES):
+        sel = bands == b
+        hr = hrs.get(name, {"hazard_ratio": 1.0, "ci_lower": float("nan"), "ci_upper": float("nan"),
+                            "model": hazard_ratio_label(outcome), "note": "reference"})
+        rows.append({
+            "band": name,
+            "n": int(sel.sum()),
+            "fraction": float(sel.sum() / n) if n else float("nan"),
+            "n_events": int((event_type[sel] == 1).sum()),
+            "n_competing": int((event_type[sel] == 2).sum()),
+            "observed_risk": observed_risk(time[sel], event_type[sel], horizon, outcome) if sel.any() else float("nan"),
+            "observed_estimator": estimator_name(outcome),
+            "hazard_ratio": hr["hazard_ratio"],
+            "hr_ci_lower": hr["ci_lower"],
+            "hr_ci_upper": hr["ci_upper"],
+            "hr_model": hr["model"],
+            "hr_note": hr["note"],
+        })
+    return rows
+
+
+# ---- orchestration over models x outcomes ------------------------------------------------
+
+
+def fit_all_cutpoints(predictions: dict, ground_truth: dict, horizon: int, percentiles=DEFAULT_PERCENTILES,
+                      min_band_fraction: float = DEFAULT_MIN_BAND_FRACTION) -> dict:
+    """FIT on the evaluated (validation) split: {model: {outcome: fit result}}. An outcome with
+    zero events in the fitting sample -> {"status": "not fitted: no events ..."}."""
+    out = {}
+    for model, preds in predictions.items():
+        out[model] = {}
+        for outcome in OUTCOME_NAMES:
+            scores, time, event_type = at_risk_horizon_data(preds[outcome], ground_truth, outcome, horizon)
+            n_events = int(((event_type == 1) & (time <= horizon)).sum())
+            if n_events == 0:
+                out[model][outcome] = {"status": "not fitted: no events in the fitting split", "n_fit": int(scores.size)}
+                continue
+            out[model][outcome] = fit_band_cutpoints(scores, time, event_type, outcome, horizon, percentiles, min_band_fraction)
+    return out
+
+
+def summarise_all_bands(predictions: dict, ground_truth: dict, fitted: dict, horizon: int) -> dict:
+    """APPLY saved cut-points: {model: {outcome: band rows or {"status": ...}}}."""
+    out = {}
+    for model, preds in predictions.items():
+        out[model] = {}
+        for outcome in OUTCOME_NAMES:
+            fit = fitted[model][outcome]
+            if fit.get("status") != "fitted":
+                out[model][outcome] = {"status": fit.get("status", "not fitted")}
+                continue
+            scores, time, event_type = at_risk_horizon_data(preds[outcome], ground_truth, outcome, horizon)
+            out[model][outcome] = band_summary(scores, fit["cutpoints"], time, event_type, outcome, horizon)
+    return out
+
+
+def save_cutpoints(path, fitted: dict, meta: dict) -> Path:
+    """Write the fitted cut-points (aggregates: two predicted-risk values per model / outcome)
+    with what they were fitted on (meta: split, horizon, split seed, data fingerprint, model
+    sources, search settings)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({**meta, "models": fitted}, indent=2))
+    return path
+
+
+def load_cutpoints(path, expected_meta: dict, models: list[str]) -> dict:
+    """{model: {outcome: fit}} from a saved cutpoints.json, refusing (CutpointsMismatchError)
+    unless it was fitted on the validation split of the same data / split seed / horizon and
+    covers the same models from the same sources."""
+    path = Path(path)
+    if not path.exists():
+        raise CutpointsMismatchError(f"no saved cut-points at {path} -- run the validation evaluation first")
+    saved = json.loads(path.read_text())
+    if saved.get("fitted_on_split") != "val":
+        raise CutpointsMismatchError(f"cut-points were fitted on '{saved.get('fitted_on_split')}', not the validation split")
+    for key in ("horizon_years", "split_seed", "data_fingerprint"):
+        if saved.get(key) != expected_meta.get(key):
+            raise CutpointsMismatchError(f"saved cut-points differ from this evaluation in '{key}'")
+    missing = [m for m in models if m not in saved["models"]]
+    if missing:
+        raise CutpointsMismatchError(f"no saved cut-points for model(s) {missing}")
+    for m in models:
+        if saved.get("model_sources", {}).get(m) != expected_meta.get("model_sources", {}).get(m):
+            raise CutpointsMismatchError(f"cut-points for '{m}' were fitted on a different checkpoint directory")
+    return {m: saved["models"][m] for m in models}
+
+
+def _num(x, fmt=".3f") -> str:
+    return "n/a" if x is None or (isinstance(x, float) and math.isnan(x)) else format(x, fmt)
+
+
+def format_banding_tables(fitted: dict, bands: dict, split: str) -> str:
+    """Markdown: cut-points per model / outcome, then the per-band table."""
+    lines = [
+        f"Risk bands on the {split} split (cut-points fitted on the validation split"
+        + ("; in-sample here, so separation and HRs are optimistic)" if split == "val" else ", applied unchanged)"),
+        "",
+        "| Model | Outcome | Cut-points (10-yr risk) | Test | Statistic | p (after search) | Fit band fractions |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for m, per in fitted.items():
+        for o in OUTCOME_NAMES:
+            f = per[o]
+            if f.get("status") != "fitted":
+                lines.append(f"| {m} | {o} | {f.get('status')} | | | | |")
+                continue
+            lines.append(f"| {m} | {o} | {f['cutpoints'][0]:.4f}, {f['cutpoints'][1]:.4f} | {f['test']} | "
+                         f"{f['statistic']:.1f} | {f['p_value_after_search']:.2g} | "
+                         + " / ".join(f"{x:.0%}" for x in f["band_fractions_fit"]) + " |")
+    lines += ["", "| Model | Outcome | Band | n | Events | Observed 10-yr risk | HR vs low (95% CI) | HR model |",
+              "|---|---|---|---|---|---|---|---|"]
+    for m, per in bands.items():
+        for o in OUTCOME_NAMES:
+            rows = per[o]
+            if isinstance(rows, dict):
+                lines.append(f"| {m} | {o} | n/a ({rows['status']}) | | | | | |")
+                continue
+            for r in rows:
+                if r["hr_note"] == "reference":
+                    hr = "1 (reference)"
+                elif r["hr_note"]:
+                    hr = f"n/a ({r['hr_note']})"
+                else:
+                    hr = f"{r['hazard_ratio']:.2f} ({r['hr_ci_lower']:.2f} to {r['hr_ci_upper']:.2f})"
+                lines.append(f"| {m} | {o} | {r['band']} | {r['n']} | {r['n_events']} | {_num(r['observed_risk'])} | "
+                             f"{hr} | {r['hr_model']} |")
+    return "\n".join(lines)

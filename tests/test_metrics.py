@@ -1,5 +1,5 @@
 """Tests for compass.evaluation.metrics: hand-computed sanity checks for time_dependent_
-cindex and integrated_brier_score_metric, plus a structural check for ipcw_calibration_curve.
+cindex and integrated_brier_score_metric (calibration: tests/test_calibration.py).
 
 wolbers_cindex tests: hand-computed sanity checks (perfect/near-random concordance) plus a
 first-pass cross-check against comprisk's independent concordance_index_uno_cr on synthetic
@@ -18,7 +18,6 @@ from comprisk.metrics import compute_uno_weights, concordance_index_uno_cr
 
 from compass.evaluation.metrics import (
     integrated_brier_score_metric,
-    ipcw_calibration_curve,
     schoop_competing_risks_ibs,
     time_dependent_cindex,
     wolbers_cindex,
@@ -77,22 +76,6 @@ def test_integrated_brier_score_miscalibrated_scores_worse():
 
     assert ibs_bad > ibs_well
     assert ibs_bad > 0.3
-
-
-def test_ipcw_calibration_curve_structure():
-    rng = np.random.default_rng(0)
-    n = 100
-    cif_at_horizon = rng.uniform(0, 1, n)
-    event_indicator = rng.integers(0, 2, n)
-    time_years = rng.uniform(1, 20, n)
-
-    curve = ipcw_calibration_curve(cif_at_horizon, event_indicator, time_years, horizon=10, n_bins=10)
-
-    assert set(curve.keys()) == {"predicted", "observed", "bin_counts", "n_total"}
-    assert len(curve["predicted"]) == len(curve["observed"]) == len(curve["bin_counts"])
-    assert curve["bin_counts"].sum() == n
-    assert curve["n_total"] == n
-    assert (curve["observed"] >= 0).all() and (curve["observed"] <= 1).all()
 
 
 def test_wolbers_cindex_perfect_concordance():

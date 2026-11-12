@@ -6,7 +6,7 @@ hidden_dim: 64         # placeholder
 num_layers: 2          # placeholder (GRU layers)
 cause_head_hidden_dim: 32  # placeholder
 learning_rate: 0.001   # placeholder
-weight_decay: 0.0      # AdamW decoupled weight decay (0 = identical to the previous plain Adam)
+weight_decay: 0.1      # AdamW decoupled weight decay; locked at 0.1 after round-2 tuning (tune_v2)
 batch_size: 128        # placeholder
 
 # Discrete-time hazard binning. PLACEHOLDER: simple yearly bins, not the locked

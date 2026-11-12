@@ -1,53 +1,86 @@
 #!/usr/bin/env python
-"""Evaluate trained models on a split's fixed landmarks (aggregates only).
+"""Evaluate trained models on a split's fixed landmarks (aggregates only): discrimination,
+overall accuracy, calibration and 3-band risk banding at the 10-yr horizon.
 
 Usage:
     python scripts/evaluate.py --checkpoint-dir runs/                 # val split, synthetic
-    python scripts/evaluate.py --checkpoint-dir runs/ --data data/processed
-    python scripts/evaluate.py --checkpoint-dir runs/ --split test --final   # ONE-TIME final report
+    python scripts/evaluate.py --final-models configs/final_models.yaml --data data/processed \\
+        --out-dir outputs/final_val                                   # final models, val split
+    python scripts/evaluate.py --final-models configs/final_models.yaml --data data/processed \\
+        --split test --final --cutpoints outputs/final_val/cutpoints.json \\
+        --out-dir outputs/final_test                                  # ONE-TIME final report
 
-Steps: load each model's best checkpoint(s) -- per-outcome selection: outcome k's predictions
-come from checkpoint_best_<k>.pt; total selection (or runs without checkpoint_selection.json):
-checkpoint_best.pt for all -> predict_risk at the 10-yr horizon (yearly CIF 1..10) on the
-split's fixed landmarks -> ground truth from build_targets (time, event,
-competing, at_risk; at_risk == 0 excluded per outcome) -> metrics (mortality: Uno C + IBS;
-MALO / CVD: Wolbers C + Schoop competing-risk IBS; IPCW reference = the TRAINING split) ->
-patient-level paired bootstrap (same resample for all models).
+Models: --checkpoint-dir <dir> (train.py's dir: <dir>/<model>/) or --final-models <yaml>
+(configs/final_models.yaml: one run directory per model plus the split directory). Per-outcome
+selection: outcome k's predictions come from checkpoint_best_<k>.pt; total selection (or runs
+without checkpoint_selection.json): checkpoint_best.pt for all. With --final-models, every
+checkpoint's stored optimiser settings must match configs/model_<model>.yaml (learning rate,
+weight decay) -- the locked final settings -- or the run is refused.
 
-Split pinning: training saved <checkpoint-dir>/<model>/split.json (patient IDs per split, the
-landmark seed, and a fingerprint of the input data). This script loads that split and seed --
-it never re-derives them -- and refuses if the data given (--data, or --n-patients /
---data-seed for synthetic) does not match the saved fingerprint, or if the models were
-trained on different splits. train.py writes checkpoints to <checkpoint-dir>/<model>/.
+Per model and outcome, in one run:
+- metrics: mortality Uno C + IBS; MALO / CVD Wolbers C + Schoop competing-risk IBS (IPCW
+  reference = the TRAINING split); patient-level paired bootstrap + pairwise differences.
+- calibration (compass.evaluation.calibration): deciles of predicted 10-yr risk vs observed
+  (Kaplan-Meier for mortality, Aalen-Johansen with death competing for MALO / CVD), overall
+  O/E; a plot per outcome (calibration_<outcome>.png, 3 models per plot).
+- risk banding (compass.evaluation.risk_banding): on --split val the two cut-points are FITTED
+  and saved to <out-dir>/cutpoints.json (in-sample: separation and HRs are optimistic); on
+  --split test they are LOADED from --cutpoints and applied unchanged -- never refitted.
 
-Writes <out-dir>/metrics.json and <out-dir>/metrics_table.md (outputs/ is git-ignored).
+Split pinning: the split saved at training (split.json: patient IDs, landmark seed, data
+fingerprint) is loaded, never re-derived; the data given must match its fingerprint. On the
+validation split the Trainers are given an EMPTY test list, so no test patient is landmarked,
+scaled or predicted. --split test requires --final (one-time final reporting) and --cutpoints.
+
+Writes to <out-dir> (outputs/ is git-ignored): metrics.json, metrics_table.md,
+calibration_table.md, banding_table.md, calibration_<outcome>.png, and cutpoints.json (val).
 """
 
 import argparse
 import json
 import logging
 import math
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 import yaml
 
 from compass.data.preprocessing import build_feature_names
 from compass.data.splitting import SplitMismatchError, check_fingerprint, data_fingerprint, load_split
 from compass.data.synthetic_generator import generate_synthetic_cohort
-from compass.evaluation.pipeline import evaluate_models, format_tables
+from compass.evaluation.calibration import calibration_all, format_calibration_tables
+from compass.evaluation.pipeline import collect_predictions, evaluate_models, format_tables
+from compass.evaluation.risk_banding import (
+    CUTPOINTS_FILE,
+    DEFAULT_MIN_BAND_FRACTION,
+    DEFAULT_PERCENTILES,
+    CutpointsMismatchError,
+    fit_all_cutpoints,
+    format_banding_tables,
+    load_cutpoints,
+    save_cutpoints,
+    summarise_all_bands,
+)
+from compass.models.base import OUTCOME_NAMES
 from compass.models.registry import MODEL_REGISTRY, build_model
-from compass.training.train import Trainer, load_selected_models
+from compass.training.train import Trainer, load_selected_models, outcome_checkpoints
+from compass.visualization.calibration_plot import save_calibration_plots
 
 log = logging.getLogger("evaluate")
+
+
+class FinalModelsError(ValueError):
+    """configs/final_models.yaml points at runs that do not match the locked settings / split."""
 
 
 def _jsonable(x):
     if isinstance(x, dict):
         return {k: _jsonable(v) for k, v in x.items()}
-    if isinstance(x, list):
+    if isinstance(x, (list, tuple)):
         return [_jsonable(v) for v in x]
     if isinstance(x, (np.integer,)):
         return int(x)
@@ -88,14 +121,74 @@ def load_pinned_split(name: str, checkpoint_dir: str, visits_df, outcomes_df) ->
     return split
 
 
-def load_trained(name: str, checkpoint_dir: str, visits_df, outcomes_df, schema: dict, training_config: dict):
-    """(trainer, model): the saved split re-used and the best checkpoint weights loaded (never
-    the latest). model is one model (total selection / older runs: checkpoint_best.pt) or
-    {outcome: model} (per-outcome selection: checkpoint_best_<outcome>.pt), as recorded in the
-    run's checkpoint_selection.json."""
-    split = load_pinned_split(name, checkpoint_dir, visits_df, outcomes_df)
+def load_trained_from(name: str, model_dir, split: dict, visits_df, outcomes_df, schema: dict, training_config: dict):
+    """(trainer, model) with `split` pinned and the best checkpoint weights in `model_dir`
+    loaded (never the latest): one model, or {outcome: model} for per-outcome checkpoints."""
     trainer, model = make_trainer(name, visits_df, outcomes_df, schema, training_config, split=split)
-    return trainer, load_selected_models(model, Path(checkpoint_dir) / name)
+    return trainer, load_selected_models(model, Path(model_dir))
+
+
+def load_trained(name: str, checkpoint_dir: str, visits_df, outcomes_df, schema: dict, training_config: dict):
+    """(trainer, model) for <checkpoint_dir>/<name>: its saved split re-used and its best
+    checkpoint(s) loaded, as recorded in the run's checkpoint_selection.json."""
+    split = load_pinned_split(name, checkpoint_dir, visits_df, outcomes_df)
+    return load_trained_from(name, Path(checkpoint_dir) / name, split, visits_df, outcomes_df, schema, training_config)
+
+
+def load_final_models_config(path) -> dict:
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    if not isinstance(cfg, dict) or "split_dir" not in cfg or not isinstance(cfg.get("models"), dict):
+        raise FinalModelsError(f"{path}: expected 'split_dir' and a 'models' mapping")
+    unknown = [m for m in cfg["models"] if m not in MODEL_REGISTRY]
+    if unknown:
+        raise FinalModelsError(f"{path}: unknown model(s) {unknown}")
+    return cfg
+
+
+def check_locked_settings(name: str, model_dir) -> None:
+    """Every checkpoint the model is evaluated from must have been trained with the learning
+    rate and weight decay in configs/model_<name>.yaml (the locked final settings)."""
+    with open(MODEL_REGISTRY[name][1]) as f:
+        cfg = yaml.safe_load(f)
+    for outcome, path in outcome_checkpoints(model_dir).items():
+        if not Path(path).exists():
+            raise FinalModelsError(f"{name}: missing checkpoint {path}")
+        group = torch.load(path, weights_only=False)["optimizer_state_dict"]["param_groups"][0]
+        lr = group.get("initial_lr", group["lr"])
+        if not (math.isclose(group["weight_decay"], float(cfg["weight_decay"]))
+                and math.isclose(lr, float(cfg["learning_rate"]))):
+            raise FinalModelsError(
+                f"{name}: {Path(path).name} ({outcome}) was trained with lr {lr:g}, weight decay {group['weight_decay']:g}; "
+                f"configs/model_{name}.yaml has lr {cfg['learning_rate']:g}, weight decay {cfg['weight_decay']:g}")
+
+
+def resolve_models(args, visits_df, outcomes_df) -> tuple[list[str], dict, dict]:
+    """(model names, {name: model run dir}, the pinned split). Raises SplitMismatchError /
+    FinalModelsError when the runs and the data do not belong together."""
+    fingerprint = data_fingerprint(visits_df, outcomes_df)
+    if args.final_models:
+        cfg = load_final_models_config(args.final_models)
+        names = [m for m in (args.models or list(cfg["models"]))]
+        missing = [m for m in names if m not in cfg["models"]]
+        if missing:
+            raise FinalModelsError(f"{args.final_models} lists no run directory for {missing}")
+        dirs = {m: Path(cfg["models"][m]) for m in names}
+        split = load_split(cfg["split_dir"])
+        check_fingerprint(split["fingerprint"], fingerprint)
+        for m in names:
+            own = load_split(dirs[m])
+            if any(own[k] != split[k] for k in ("train", "val", "seed")) or own.get("fingerprint") != split["fingerprint"]:
+                raise SplitMismatchError(f"model '{m}' ({dirs[m]}) was trained on a different split than {cfg['split_dir']}")
+            check_locked_settings(m, dirs[m])
+        return names, dirs, split
+    names = args.models or list(MODEL_REGISTRY)
+    splits = {m: load_pinned_split(m, args.checkpoint_dir, visits_df, outcomes_df) for m in names}
+    first = splits[names[0]]
+    for m, sp in splits.items():
+        if any(sp[k] != first[k] for k in ("train", "val", "test", "seed")):
+            raise SplitMismatchError(f"model '{m}' was trained on a different split than '{names[0]}'")
+    return names, {m: Path(args.checkpoint_dir) / m for m in names}, first
 
 
 def main(argv=None) -> int:
@@ -103,8 +196,12 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--split", choices=["val", "test"], default="val")
     p.add_argument("--final", action="store_true", help="Required for --split test (one-time final reporting).")
-    p.add_argument("--checkpoint-dir", required=True, help="train.py's --checkpoint-dir (holds <model>/checkpoint_best*.pt)")
-    p.add_argument("--models", nargs="+", choices=list(MODEL_REGISTRY), default=list(MODEL_REGISTRY))
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--checkpoint-dir", help="train.py's --checkpoint-dir (holds <model>/checkpoint_best*.pt)")
+    src.add_argument("--final-models", help="configs/final_models.yaml: the locked final run directory per model")
+    p.add_argument("--models", nargs="+", choices=list(MODEL_REGISTRY), default=None)
+    p.add_argument("--cutpoints", default=None,
+                   help="--split test: the cutpoints.json saved by the validation run (applied unchanged).")
     p.add_argument("--data", default=None, help="Processed real-data dir (scripts/build_cohort.py). Omit for synthetic.")
     p.add_argument("--n-patients", type=int, default=1000, help="Synthetic only; checked against the saved fingerprint.")
     p.add_argument("--data-seed", type=int, default=None, help="Synthetic only; checked against the saved fingerprint.")
@@ -116,6 +213,10 @@ def main(argv=None) -> int:
     if args.split == "test":
         if not args.final:
             print("refusing: --split test requires --final (the test split is for ONE-TIME final reporting)", file=sys.stderr)
+            return 2
+        if not args.cutpoints:
+            print("refusing: --split test requires --cutpoints (the validation run's cutpoints.json; "
+                  "cut-points are never refitted on the test split)", file=sys.stderr)
             return 2
         log.warning("Evaluating the TEST split. The test split is for one-time final reporting only -- "
                     "do not use these numbers for model selection or tuning.")
@@ -131,31 +232,71 @@ def main(argv=None) -> int:
         seed = args.data_seed if args.data_seed is not None else training_config["seed"]
         visits_df, outcomes_df = generate_synthetic_cohort(n_patients=args.n_patients, seed=seed)
 
-    trainers, models = {}, {}
     try:
-        splits = {name: load_pinned_split(name, args.checkpoint_dir, visits_df, outcomes_df) for name in args.models}
-        first = splits[args.models[0]]
-        for name, sp in splits.items():
-            if any(sp[k] != first[k] for k in ("train", "val", "test", "seed")):
-                raise SplitMismatchError(f"model '{name}' was trained on a different split than '{args.models[0]}'")
-    except SplitMismatchError as exc:
+        names, model_dirs, split = resolve_models(args, visits_df, outcomes_df)
+    except (SplitMismatchError, FinalModelsError) as exc:
         print(f"refusing: {exc}", file=sys.stderr)
         return 3
-    for name in args.models:
-        trainers[name], models[name] = load_trained(name, args.checkpoint_dir, visits_df, outcomes_df, schema, training_config)
 
     horizon = int(training_config["horizons"]["primary"])
-    bootstrap_seed = args.bootstrap_seed if args.bootstrap_seed is not None else int(training_config["seed"])
-    results = evaluate_models(trainers, models, args.split, horizon, args.n_bootstrap, bootstrap_seed)
-    results["data"] = "real (processed)" if args.data else "synthetic"
+    meta = {
+        "fitted_on_split": "val",
+        "horizon_years": horizon,
+        "split_seed": int(split["seed"]),
+        "data_fingerprint": split["fingerprint"],
+        "model_sources": {m: os.path.normpath(str(model_dirs[m])) for m in names},
+        "candidate_percentiles": [min(DEFAULT_PERCENTILES), max(DEFAULT_PERCENTILES), 1],
+        "min_band_fraction": DEFAULT_MIN_BAND_FRACTION,
+    }
+    saved_cutpoints = None
+    if args.split == "test":  # load (and check) the validation cut-points BEFORE any test-split work
+        try:
+            saved_cutpoints = load_cutpoints(args.cutpoints, meta, names)
+        except CutpointsMismatchError as exc:
+            print(f"refusing: {exc}", file=sys.stderr)
+            return 4
 
-    table = format_tables(results)
-    print(table)
+    # validation runs: the Trainers never see the test IDs (nothing in the test split is landmarked)
+    trainer_split = split if args.split == "test" else {**split, "test": []}
+    trainers, models = {}, {}
+    for m in names:
+        trainers[m], models[m] = load_trained_from(m, model_dirs[m], trainer_split, visits_df, outcomes_df, schema,
+                                                   training_config)
+
+    bootstrap_seed = args.bootstrap_seed if args.bootstrap_seed is not None else int(training_config["seed"])
+    collected = collect_predictions(trainers, models, args.split, horizon)
+    _, ground_truth, predictions = collected
+    results = evaluate_models(trainers, models, args.split, horizon, args.n_bootstrap, bootstrap_seed, collected=collected)
+    results["data"] = "real (processed)" if args.data else "synthetic"
+    results["model_sources"] = meta["model_sources"]
+
+    calibration = calibration_all(predictions, ground_truth, horizon)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    if args.split == "val":
+        cutpoints = fit_all_cutpoints(predictions, ground_truth, horizon)
+        save_cutpoints(out / CUTPOINTS_FILE, _jsonable(cutpoints), meta)
+        cutpoints_source = str(out / CUTPOINTS_FILE)
+    else:
+        cutpoints = saved_cutpoints
+        cutpoints_source = args.cutpoints
+    bands = summarise_all_bands(predictions, ground_truth, cutpoints, horizon)
+    results["calibration"] = calibration
+    results["banding"] = {"cutpoints_source": cutpoints_source, "refitted_on_this_split": args.split == "val",
+                          "cutpoints": cutpoints, "bands": bands}
+    plots = save_calibration_plots(calibration, OUTCOME_NAMES, out)
+
+    tables = {
+        "metrics_table.md": format_tables(results),
+        "calibration_table.md": format_calibration_tables(calibration),
+        "banding_table.md": format_banding_tables(cutpoints, bands, args.split),
+    }
+    for fname, text in tables.items():
+        print(text + "\n")
+        (out / fname).write_text(text + "\n")
     (out / "metrics.json").write_text(json.dumps(_jsonable(results), indent=2))
-    (out / "metrics_table.md").write_text(table + "\n")
-    print(f"\nwrote {out}/metrics.json and {out}/metrics_table.md")
+    written = ["metrics.json", *tables, *(p.name for p in plots)] + ([CUTPOINTS_FILE] if args.split == "val" else [])
+    print(f"wrote to {out}/: " + ", ".join(written))
     return 0
 
 

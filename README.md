@@ -45,11 +45,13 @@ censoring actually works:
   competing-risks-adjusted Brier score (near-exact match to pec::pec) instead.
 
 On top of per-model metrics: paired bootstrap comparison across all three architectures (same
-resampled patients, same metrics, for a fair head-to-head), risk score banding into clinical
-bands via outcome-optimized cutpoint search (log-rank for mortality, Gray's test for MALO/CVD)
-with a quantile-based fallback when event counts are too sparse for outcome-optimized
-cutpoints (as MALO's rarity already triggers in testing), hazard-ratio reporting between
-bands, and discrimination-calibration scatter visualization.
+resampled patients, same metrics, for a fair head-to-head); calibration at 10 years (deciles
+of predicted risk vs Kaplan-Meier observed risk for mortality, Aalen-Johansen with death
+competing for MALO/CVD, overall O/E, one plot per outcome); three risk bands per model and
+outcome, with two cut-points searched on the validation split (log-rank for mortality, Gray's
+test for MALO/CVD; each band >= 10% of patients; no fallback rule) and applied unchanged to
+the test split, with hazard ratios vs the low band (Cox; cause-specific Cox for MALO/CVD); and
+discrimination-calibration scatter visualization.
 
 ## Setup
 
@@ -68,7 +70,7 @@ pip install -e ".[dev]"
 The full pipeline is built end-to-end: synthetic data generation → schema validation →
 preprocessing (landmarking, missingness masking, scaling, patient-level splitting) → all
 three candidate architectures → outcome-split evaluation → paired model comparison → risk
-banding → visualization. 105 tests passing. Still pending: the real dataset (IRB approval in
+banding → visualization. 299 tests passing. Still pending: the real dataset (IRB approval in
 progress) — everything above has been built and validated against the synthetic generator in
 `data/synthetic/` in the meantime.
 

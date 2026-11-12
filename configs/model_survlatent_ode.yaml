@@ -6,7 +6,7 @@ latent_dim: 16           # placeholder
 ode_hidden_dim: 32       # placeholder (MLP hidden size for dh/dt = f(h))
 cause_head_hidden_dim: 16  # placeholder
 learning_rate: 0.001     # placeholder
-weight_decay: 0.0        # AdamW decoupled weight decay (0 = identical to the previous plain Adam)
+weight_decay: 0.1        # AdamW decoupled weight decay; locked at 0.1 after round-2 tuning (tune_v2)
 batch_size: 64           # placeholder (smaller than the other two models' default 128 --
                           # ODE solves are more expensive per example than a GRU/attention step)
 

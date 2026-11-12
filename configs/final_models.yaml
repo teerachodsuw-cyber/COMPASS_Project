@@ -1,0 +1,17 @@
+# Final models, locked after round-2 tuning (tune_v2, 2026-11-12): learning_rate 0.001 and
+# weight_decay 0.1 for all three (the winner per model: lowest sum of the per-outcome best val
+# NLLs). No retraining -- scripts/evaluate.py --final-models loads these run directories as-is.
+#
+# Each model directory holds the per-outcome checkpoints (checkpoint_best_<outcome>.pt, listed
+# in checkpoint_selection.json): outcome k is predicted from outcome k's checkpoint only.
+# evaluate.py refuses a directory whose checkpoints were trained with a different weight decay /
+# learning rate than configs/model_<model>.yaml.
+#
+# split_dir holds the full pinned split (split.json, incl. the test IDs, seed and data
+# fingerprint). The per-config split.json files have an empty test list (tuning never loads
+# the test split); their train / val / seed / fingerprint must match split_dir's.
+split_dir: runs/tune_v2
+models:
+  dynamic_deephit: runs/tune_v2/dynamic_deephit/lr0.001_wd0.1
+  tracer: runs/tune_v2/tracer/lr0.001_wd0.1
+  survlatent_ode: runs/tune_v2/survlatent_ode/lr0.001_wd0.1

@@ -2,10 +2,9 @@
 integrated Brier score per outcome per horizon, via scikit-survival -- hand-implementing
 IPCW-adjusted metrics is exactly the kind of thing that's easy to get subtly wrong, so this
 wraps sksurv rather than reimplementing, per the locked methodology's choice of Uno's C
-(horizon-specific, IPCW-adjusted) over a whole-follow-up Harrell's C. Also implements the
-IPCW-weighted calibration curve (via lifelines' Kaplan-Meier estimator, already a project
-dependency), locked as part of the methodology as a supplementary diagnostic separate from
-the discrimination-calibration scatter.
+(horizon-specific, IPCW-adjusted) over a whole-follow-up Harrell's C. Calibration (deciles of
+predicted risk vs Kaplan-Meier / Aalen-Johansen observed risk, O/E) lives in
+compass.evaluation.calibration.
 
 Units: all times (event_or_censoring_time, horizon, time_grid) are in YEARS from landmark,
 matching the project's single 10-year horizon (configs/training.yaml: horizons.primary) -- distinct
@@ -30,7 +29,6 @@ R pec reference fixtures (pec estimates G from the same data), not for model eva
 
 import numpy as np
 import pandas as pd
-from lifelines import KaplanMeierFitter
 from sksurv.metrics import concordance_index_ipcw, integrated_brier_score
 
 from compass.models.base import DEATH_OUTCOME, OUTCOME_NAMES
@@ -448,48 +446,6 @@ def integrated_brier_score_metric(
         col_idx = np.arange(len(time_grid))
 
     return float(integrated_brier_score(y_ref, y, survival_over_time[:, col_idx], safe_grid))
-
-
-def ipcw_calibration_curve(
-    cif_at_horizon: np.ndarray,
-    event_indicator: np.ndarray,
-    event_or_censoring_time: np.ndarray,
-    horizon: float,
-    n_bins: int = 10,
-) -> dict:
-    """Bin patients by predicted cif_at_horizon into n_bins groups; for each non-empty bin,
-    compute the IPCW-corrected true event rate (1 - Kaplan-Meier survival at `horizon` for
-    that bin's patients, which naturally accounts for censoring within the bin) vs. the mean
-    predicted CIF in that bin.
-
-    Returns {"predicted": array, "observed": array, "bin_counts": array, "n_total": int}.
-    """
-    bin_edges = np.quantile(cif_at_horizon, np.linspace(0.0, 1.0, n_bins + 1))
-    bin_edges[0] -= 1e-9  # ensure the minimum value falls inside bin 0 with right-inclusive digitize
-    bin_edges = np.unique(bin_edges)  # guard against degenerate/duplicate edges (heavy ties in CIF)
-
-    bin_idx = np.digitize(cif_at_horizon, bin_edges[1:-1], right=True)
-
-    predicted, observed, bin_counts = [], [], []
-    for b in range(len(bin_edges) - 1):
-        in_bin = bin_idx == b
-        n_in_bin = int(in_bin.sum())
-        if n_in_bin == 0:
-            continue
-        predicted.append(float(cif_at_horizon[in_bin].mean()))
-
-        kmf = KaplanMeierFitter()
-        kmf.fit(durations=event_or_censoring_time[in_bin], event_observed=event_indicator[in_bin])
-        survival_at_horizon = float(kmf.predict(horizon))
-        observed.append(1.0 - survival_at_horizon)
-        bin_counts.append(n_in_bin)
-
-    return {
-        "predicted": np.array(predicted),
-        "observed": np.array(observed),
-        "bin_counts": np.array(bin_counts),
-        "n_total": len(cif_at_horizon),
-    }
 
 
 def compute_all_metrics(predictions: dict, ground_truth: dict, censoring_reference: dict, horizon: int) -> pd.DataFrame:

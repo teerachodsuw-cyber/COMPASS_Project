@@ -1,129 +1,181 @@
-"""Tests for compass.evaluation.risk_banding: outcome-optimized cutpoint search (log-rank
-for mortality, Gray's test for malo/cvd), the outcome-blind quantile fallback, the fit/apply
-separation that prevents test-data leakage into cutpoint selection, and Cox hazard ratios.
-"""
+"""Tests for compass.evaluation.risk_banding: two cut-points / three bands (each >= 10%),
+log-rank (mortality) vs Gray's test (MALO / CVD), fit-on-validation / apply-unchanged,
+Cox / cause-specific Cox hazard ratios, cutpoints.json save / load checks. Synthetic only."""
+
+import math
 
 import numpy as np
+import pytest
 from comprisk.gray_test import gray_test
+from lifelines import CoxPHFitter
+from lifelines.statistics import multivariate_logrank_test
 
+from compass.evaluation.calibration import aalen_johansen_cif
 from compass.evaluation.risk_banding import (
-    apply_cutpoint,
-    assign_quantile_bands,
-    compute_band_hazard_ratios,
-    find_optimal_cutpoint_gray,
-    find_optimal_cutpoint_logrank,
-    is_outcome_optimized_reliable,
+    CutpointsMismatchError,
+    NoValidCutpointsError,
+    assign_bands,
+    band_hazard_ratios,
+    band_summary,
+    fit_all_cutpoints,
+    fit_band_cutpoints,
+    load_cutpoints,
+    save_cutpoints,
+    summarise_all_bands,
 )
 
-
-def test_logrank_cutpoint_finds_real_separation():
-    rng = np.random.default_rng(0)
-    n = 300
-    scores = rng.uniform(0, 1, n)
-    # Known true separation at score=0.5: above -> much earlier events.
-    event_time = np.where(scores > 0.5, rng.exponential(2, n), rng.exponential(15, n))
-    event_time = np.clip(event_time, 0.01, 30)
-    event_indicator = np.ones(n, dtype=int)
-
-    result = find_optimal_cutpoint_logrank(scores, event_indicator, event_time)
-
-    assert abs(result["cutpoint"] - 0.5) < 0.15
-    assert result["p_value"] < 0.01
+COARSE = tuple(range(10, 91, 5))  # fewer candidates keeps the tests fast
 
 
-def test_gray_cutpoint_accounts_for_competing_risk():
-    rng = np.random.default_rng(1)
-    n = 400
-    scores = rng.uniform(0, 1, n)
-    group_high = scores > 0.5
-
-    # TRUE malo-susceptibility-generating-process is IDENTICAL between groups, but the
-    # high-score group has much higher mortality (competing risk), censoring many of them
-    # out before malo can occur -- naive log-rank (treating competing deaths as censoring)
-    # sees this as "protective" for malo; Gray's test should not be fooled the same way.
-    malo_latent_time = rng.exponential(10, n)
-    mortality_time = np.where(group_high, rng.exponential(2, n), rng.exponential(50, n))
-
-    event_time = np.minimum(np.minimum(malo_latent_time, mortality_time), 20.0)
-    malo_event = ((event_time == malo_latent_time) & (malo_latent_time <= 20.0)).astype(int)
-    competing_event = ((event_time == mortality_time) & (mortality_time <= 20.0) & (malo_event == 0)).astype(int)
-
-    # Naive log-rank on the same data, ignoring the competing risk entirely (as if
-    # find_optimal_cutpoint_logrank were used on malo/cvd -- the wrong tool).
-    naive_result = find_optimal_cutpoint_logrank(scores, malo_event, event_time)
-
-    # Gray's test (comprisk) at the SAME cutpoint=0.5, for a fair apples-to-apples comparison.
-    event_code = np.where(malo_event.astype(bool), 1, np.where(competing_event.astype(bool), 2, 0))
-    group = (scores > 0.5).astype(int)
-    gray_result = gray_test(event_time, event_code, group, cause=1)
-
-    from lifelines.statistics import logrank_test
-
-    high = scores > 0.5
-    naive = logrank_test(
-        event_time[high], event_time[~high], event_observed_A=malo_event[high], event_observed_B=malo_event[~high]
-    )
-
-    # The two tests must disagree substantially on the same data -- proving the competing-
-    # risk correction is actually doing something, not just present but inert.
-    assert abs(gray_result.stat - naive.test_statistic) > 5.0
-    assert naive_result["cutpoint"] is not None  # sanity: naive search still ran successfully
+def _cohort(n=600, seed=0, competing=True):
+    """Risk score -> event hazard; optional competing death. Times in years."""
+    rng = np.random.default_rng(seed)
+    score = rng.uniform(0, 1, n)
+    latent = rng.exponential(1 / (0.02 + 0.25 * score ** 2))
+    death = rng.exponential(30, n) if competing else np.full(n, np.inf)
+    censor = rng.uniform(3, 15, n)
+    time = np.minimum.reduce([latent, death, censor])
+    event_type = np.where(time == latent, 1, np.where(time == death, 2, 0))
+    return score, time, event_type
 
 
-def test_quantile_fallback_triggers_correctly():
-    rng = np.random.default_rng(2)
-    n = 200
-    # Mimics MALO's real rarity: very few events.
-    sparse_event_indicator = np.zeros(n, dtype=int)
-    sparse_event_indicator[:4] = 1  # only 4 events total, far below the 2*15=30 threshold
-
-    assert is_outcome_optimized_reliable(sparse_event_indicator) is False
-
-    scores = rng.uniform(0, 1, n)
-    bands = assign_quantile_bands(scores, n_bands=3)
-    assert set(np.unique(bands)) <= {0, 1, 2}
-    assert len(bands) == n
-    counts = np.bincount(bands, minlength=3)
-    assert (counts > 0).all()  # every band actually got assigned some patients
+def test_cutpoints_give_three_bands_each_at_least_10_percent():
+    score, time, event_type = _cohort()
+    for outcome, et in (("mortality", np.where(event_type == 1, 1, 0)), ("malo", event_type)):
+        fit = fit_band_cutpoints(score, time, et, outcome, horizon=10, percentiles=COARSE)
+        c1, c2 = fit["cutpoints"]
+        assert fit["status"] == "fitted" and c1 < c2
+        bands = assign_bands(score, fit["cutpoints"])
+        counts = np.bincount(bands, minlength=3)
+        assert len(counts) == 3 and counts.min() >= math.ceil(0.10 * score.size)
+        assert all(f >= 0.10 for f in fit["band_fractions_fit"])
+        assert fit["band_fractions_fit"] == pytest.approx(counts / score.size)
 
 
-def test_cutpoint_fit_apply_separation():
-    rng = np.random.default_rng(3)
-    n_fit, n_other = 300, 100
-
-    fit_scores = rng.uniform(0, 1, n_fit)
-    fit_event_time = np.where(fit_scores > 0.5, rng.exponential(2, n_fit), rng.exponential(15, n_fit))
-    fit_event_indicator = np.ones(n_fit, dtype=int)
-
-    fitted = find_optimal_cutpoint_logrank(fit_scores, fit_event_indicator, fit_event_time)
-
-    # A DIFFERENT dataset, drawn from a totally different score distribution.
-    other_scores = rng.uniform(5, 10, n_other)
-
-    bands = apply_cutpoint(other_scores, fitted["cutpoint"])
-
-    # apply_cutpoint must use ONLY the already-fit cutpoint value, never re-derive one from
-    # other_scores -- since fitted["cutpoint"] is ~0.5-ish and other_scores are all >> 0.5,
-    # every single patient in `other` must land in the high band. If apply_cutpoint were
-    # silently re-fitting on other_scores instead, this would NOT hold.
-    assert (bands == 1).all()
+def test_search_uses_logrank_for_mortality_and_gray_for_malo():
+    score, time, event_type = _cohort(seed=1)
+    t10, e10 = np.minimum(time, 10), np.where(time > 10, 0, event_type)
+    mort = fit_band_cutpoints(score, time, np.where(event_type == 1, 1, 0), "mortality", 10, percentiles=COARSE)
+    bands = assign_bands(score, mort["cutpoints"])
+    assert mort["test"] == "log-rank"
+    assert mort["statistic"] == pytest.approx(multivariate_logrank_test(t10, bands, e10 == 1).test_statistic)
+    malo = fit_band_cutpoints(score, time, event_type, "malo", 10, percentiles=COARSE)
+    bands = assign_bands(score, malo["cutpoints"])
+    assert malo["test"] == "Gray"
+    assert malo["statistic"] == pytest.approx(gray_test(t10, e10, bands, cause=1).stat)
 
 
-def test_hazard_ratio_known_case():
-    rng = np.random.default_rng(4)
-    n_per_group = 500
-    # Group 0: baseline hazard rate 0.1/yr. Group 1: hazard rate 0.3/yr -> true HR = 3.0.
-    true_hr = 3.0
-    time_0 = rng.exponential(1 / 0.1, n_per_group)
-    time_1 = rng.exponential(1 / (0.1 * true_hr), n_per_group)
+def test_chosen_pair_maximises_the_statistic_among_eligible_pairs():
+    score, time, event_type = _cohort(n=300, seed=2)
+    fit = fit_band_cutpoints(score, time, event_type, "cvd", 10, percentiles=COARSE)
+    t10, e10 = np.minimum(time, 10), np.where(time > 10, 0, event_type)
+    cands = np.unique(np.quantile(score, np.array(COARSE) / 100))
+    best = max(gray_test(t10, e10, assign_bands(score, (a, b)), cause=1).stat
+               for i, a in enumerate(cands) for b in cands[i + 1:]
+               if np.bincount(assign_bands(score, (a, b)), minlength=3).min() >= math.ceil(0.1 * score.size))
+    assert fit["statistic"] == pytest.approx(best)
 
-    band_assignment = np.array([0] * n_per_group + [1] * n_per_group)
-    event_time = np.concatenate([time_0, time_1])
-    event_time = np.clip(event_time, 0.001, 30.0)
-    event_indicator = np.ones(len(event_time), dtype=int)
 
-    hr_df = compute_band_hazard_ratios(band_assignment, event_indicator, event_time, reference_band=0)
+def test_no_eligible_pair_raises():
+    score, time, event_type = _cohort(n=200, seed=3)
+    with pytest.raises(NoValidCutpointsError):
+        fit_band_cutpoints(score, time, event_type, "malo", 10, percentiles=COARSE, min_band_fraction=0.4)
+    with pytest.raises(NoValidCutpointsError):  # all predictions tied -> a single candidate, no pair
+        fit_band_cutpoints(np.full(200, 0.3), time, event_type, "malo", 10, percentiles=COARSE)
 
-    row = hr_df[hr_df["band"] == "1"].iloc[0]
-    assert 2.0 < row["hazard_ratio"] < 4.5  # generous tolerance given sampling noise
-    assert row["ci_lower"] < true_hr < row["ci_upper"]
+
+def test_cutpoints_fitted_on_val_are_applied_unchanged_to_another_split():
+    score, time, event_type = _cohort(seed=4)
+    fit = fit_band_cutpoints(score, time, event_type, "malo", 10, percentiles=COARSE)
+    c1, c2 = fit["cutpoints"]
+    # another split with a completely different score distribution: refitting would put ~1/3
+    # in each band; applying the saved values puts everyone above c2 in the high band.
+    other = np.random.default_rng(5).uniform(c2 + 0.01, c2 + 1.0, 250)
+    assert (assign_bands(other, fit["cutpoints"]) == 2).all()
+    assert (assign_bands(np.array([c1, c1 + 1e-9, c2, c2 + 1e-9]), (c1, c2)) == [0, 1, 1, 2]).all()
+
+
+def test_summarise_applies_saved_cutpoints_without_refitting(monkeypatch):
+    import compass.evaluation.risk_banding as rb
+
+    score, time, event_type = _cohort(seed=6)
+    gt = {o: {"time_years": time, "event_type": event_type if o != "mortality" else np.where(event_type == 1, 1, 0),
+              "at_risk": np.ones(score.size, bool)} for o in ("mortality", "malo", "cvd")}
+    preds = {"tracer": {o: np.repeat(score[:, None], 10, axis=1) for o in gt}}
+    fitted = fit_all_cutpoints(preds, gt, 10, percentiles=COARSE)
+
+    def must_not_fit(*a, **k):
+        raise AssertionError("cut-points were refitted at application time")
+
+    monkeypatch.setattr(rb, "fit_band_cutpoints", must_not_fit)
+    shifted = {"tracer": {o: v + 0.5 for o, v in preds["tracer"].items()}}  # another split's scores
+    bands = summarise_all_bands(shifted, gt, fitted, 10)
+    for o in gt:
+        expected = np.bincount(assign_bands(score + 0.5, fitted["tracer"][o]["cutpoints"]), minlength=3)
+        assert [r["n"] for r in bands["tracer"][o]] == list(expected)
+
+
+def test_outcome_without_events_is_reported_not_banded():
+    score, time, _ = _cohort(n=200, seed=7)
+    gt = {o: {"time_years": time, "event_type": np.zeros(200, int), "at_risk": np.ones(200, bool)}
+          for o in ("mortality", "malo", "cvd")}
+    fitted = fit_all_cutpoints({"tracer": {o: np.repeat(score[:, None], 10, axis=1) for o in gt}}, gt, 10, COARSE)
+    assert all(fitted["tracer"][o]["status"].startswith("not fitted") for o in gt)
+
+
+def test_hazard_ratios_vs_low_band_known_case():
+    rng = np.random.default_rng(8)
+    n = 700
+    bands = np.repeat([0, 1, 2], n)
+    time = rng.exponential(1 / (0.1 * np.array([1.0, 2.0, 4.0])[bands]))
+    event_type = np.ones(3 * n, int)
+    rows = {r["band"]: r for r in band_hazard_ratios(bands, np.minimum(time, 30), event_type, "mortality")}
+    assert rows["intermediate"]["ci_lower"] < 2.0 < rows["intermediate"]["ci_upper"]
+    assert rows["high"]["ci_lower"] < 4.0 < rows["high"]["ci_upper"]
+    assert rows["high"]["model"] == "Cox"
+
+
+def test_malo_hazard_ratios_are_cause_specific():
+    score, time, event_type = _cohort(seed=9)
+    cutpoints = fit_band_cutpoints(score, time, event_type, "malo", 10, percentiles=COARSE)["cutpoints"]
+    rows = band_summary(score, cutpoints, time, event_type, "malo", 10)
+    assert [r["band"] for r in rows] == ["low", "intermediate", "high"]
+    assert rows[0]["hazard_ratio"] == 1.0 and all(r["hr_model"] == "cause-specific Cox" for r in rows)
+    # cause-specific: a Cox fit with competing deaths CENSORED, follow-up truncated at 10 yr
+    t10, e10 = np.minimum(time, 10), np.where(time > 10, 0, event_type)
+    bands = assign_bands(score, cutpoints)
+    import pandas as pd
+    df = pd.DataFrame({"d": t10, "e": (e10 == 1).astype(int), "i": (bands == 1).astype(int), "h": (bands == 2).astype(int)})
+    hr = CoxPHFitter().fit(df, "d", "e").summary["exp(coef)"]
+    assert rows[1]["hazard_ratio"] == pytest.approx(hr["i"]) and rows[2]["hazard_ratio"] == pytest.approx(hr["h"])
+    # per band: n, events within 10 yr, Aalen-Johansen observed risk
+    for b, r in enumerate(rows):
+        sel = bands == b
+        assert r["n"] == sel.sum() and r["n_events"] == int((e10[sel] == 1).sum())
+        assert r["observed_risk"] == pytest.approx(aalen_johansen_cif(t10[sel], e10[sel], 10))
+
+
+def test_band_without_events_gives_nan_hr_with_reason():
+    bands = np.repeat([0, 1, 2], 20)
+    event_type = np.concatenate([np.zeros(20, int), np.ones(20, int), np.ones(20, int)])
+    rows = band_hazard_ratios(bands, np.linspace(1, 9, 60), event_type, "cvd")
+    assert all(math.isnan(r["hazard_ratio"]) and "no events" in r["note"] for r in rows)
+
+
+def test_cutpoints_file_round_trip_and_refusals(tmp_path):
+    meta = {"fitted_on_split": "val", "horizon_years": 10, "split_seed": 42,
+            "data_fingerprint": {"patients": 10}, "model_sources": {"tracer": "runs/x/tracer"}}
+    fitted = {"tracer": {"mortality": {"status": "fitted", "cutpoints": [0.1, 0.3]}}}
+    path = save_cutpoints(tmp_path / "cutpoints.json", fitted, meta)
+    assert load_cutpoints(path, meta, ["tracer"]) == fitted
+    with pytest.raises(CutpointsMismatchError, match="split_seed"):
+        load_cutpoints(path, {**meta, "split_seed": 1}, ["tracer"])
+    with pytest.raises(CutpointsMismatchError, match="different checkpoint"):
+        load_cutpoints(path, {**meta, "model_sources": {"tracer": "runs/y/tracer"}}, ["tracer"])
+    with pytest.raises(CutpointsMismatchError, match="no saved cut-points for model"):
+        load_cutpoints(path, meta, ["tracer", "survlatent_ode"])
+    save_cutpoints(tmp_path / "bad.json", fitted, {**meta, "fitted_on_split": "test"})
+    with pytest.raises(CutpointsMismatchError, match="not the validation split"):
+        load_cutpoints(tmp_path / "bad.json", meta, ["tracer"])
+    with pytest.raises(CutpointsMismatchError, match="no saved cut-points at"):
+        load_cutpoints(tmp_path / "missing.json", meta, ["tracer"])

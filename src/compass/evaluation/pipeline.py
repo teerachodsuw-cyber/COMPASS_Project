@@ -103,19 +103,29 @@ def outcome_counts(ground_truth: dict, horizon: int) -> dict:
     return out
 
 
-def evaluate_models(trainers: dict, models: dict, split: str, horizon: int, n_bootstrap: int, seed: int) -> dict:
-    """trainers / models: {model_name: Trainer / best-checkpoint weights} -- each model entry
-    is one model, or {outcome: model} for per-outcome checkpoints (predict_selected_cifs).
-    Returns a JSON-serialisable dict of aggregates."""
+def collect_predictions(trainers: dict, models: dict, split: str, horizon: int) -> tuple[list, dict, dict]:
+    """(patient_ids, ground truth, {model_name: {outcome: (n, horizon) CIF}}) on a split's
+    fixed landmarks, checking every model sees the same patients in the same order. Shared by
+    the metrics, calibration and risk banding so all three use the same predictions."""
     names = list(models)
-    ref_trainer = trainers[names[0]]
-    patient_ids, ground_truth = split_ground_truth(ref_trainer, split)
+    patient_ids, ground_truth = split_ground_truth(trainers[names[0]], split)
     for name in names[1:]:
         other_ids, _ = split_ground_truth(trainers[name], split)
         if other_ids != patient_ids:
             raise ValueError(f"model '{name}' was evaluated on a different {split} split / patient order")
-    reference = censoring_reference_from_train(ref_trainer)
     predictions = {name: predict_selected_cifs(models[name], trainers[name], split, horizon) for name in names}
+    return patient_ids, ground_truth, predictions
+
+
+def evaluate_models(trainers: dict, models: dict, split: str, horizon: int, n_bootstrap: int, seed: int,
+                    collected: tuple | None = None) -> dict:
+    """trainers / models: {model_name: Trainer / best-checkpoint weights} -- each model entry
+    is one model, or {outcome: model} for per-outcome checkpoints (predict_selected_cifs).
+    collected: collect_predictions(...)'s result, if already computed. Returns a
+    JSON-serialisable dict of aggregates (C-index, IBS, bootstrap CIs, pairwise differences)."""
+    names = list(models)
+    patient_ids, ground_truth, predictions = collected or collect_predictions(trainers, models, split, horizon)
+    reference = censoring_reference_from_train(trainers[names[0]])
 
     per_model, pairwise = paired_bootstrap(predictions, ground_truth, reference, horizon, n_iterations=n_bootstrap, seed=seed)
     return {

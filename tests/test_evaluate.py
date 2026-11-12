@@ -63,6 +63,20 @@ def test_evaluate_runs_end_to_end_on_val(trained, tmp_path):
     assert len({r["comparison"] for r in results["pairwise"]}) == 3
     table = (tmp_path / "metrics_table.md").read_text()
     assert "| Model | Outcome | C-index (95% CI) | IBS (95% CI) | n at risk | n events |" in table
+    # calibration + banding in the same run
+    for f in ("calibration_table.md", "banding_table.md", "cutpoints.json",
+              "calibration_mortality.png", "calibration_malo.png", "calibration_cvd.png"):
+        assert (tmp_path / f).exists(), f
+    assert set(results["calibration"]) == set(MODELS)
+    assert all(len(results["calibration"][m][o]["groups"]) == 10 for m in MODELS for o in ("mortality", "malo", "cvd"))
+    saved = json.loads((tmp_path / "cutpoints.json").read_text())
+    assert saved["fitted_on_split"] == "val" and set(saved["models"]) == set(MODELS)
+    assert results["banding"]["refitted_on_this_split"] is True
+    for m in MODELS:
+        for o, fit in saved["models"][m].items():
+            if fit["status"] == "fitted":
+                assert all(f >= 0.10 for f in fit["band_fractions_fit"])
+                assert [r["band"] for r in results["banding"]["bands"][m][o]] == ["low", "intermediate", "high"]
 
 
 def test_test_split_without_final_refuses(trained, tmp_path, capsys):
@@ -72,11 +86,122 @@ def test_test_split_without_final_refuses(trained, tmp_path, capsys):
     assert not (tmp_path / "metrics.json").exists()
 
 
-def test_test_split_with_final_warns(trained, tmp_path, caplog):
+def test_test_split_without_cutpoints_refuses(trained, tmp_path, capsys):
     ckpt_dir, _ = trained
+    assert evaluate_script.main(_argv(ckpt_dir, tmp_path, "--split", "test", "--final")) == 2
+    assert "requires --cutpoints" in capsys.readouterr().err
+    assert not (tmp_path / "metrics.json").exists()
+
+
+@pytest.fixture(scope="module")
+def val_cutpoints(trained, tmp_path_factory):
+    """A validation run of dynamic_deephit: its saved cutpoints.json."""
+    ckpt_dir, _ = trained
+    out = tmp_path_factory.mktemp("val_out")
+    assert evaluate_script.main(_argv(ckpt_dir, out, "--models", "dynamic_deephit")) == 0
+    return out / "cutpoints.json"
+
+
+def test_test_split_with_final_warns_and_applies_saved_cutpoints(trained, val_cutpoints, tmp_path, caplog, monkeypatch):
+    ckpt_dir, _ = trained
+
+    def must_not_refit(*a, **k):
+        raise AssertionError("cut-points were refitted on the test split")
+
+    monkeypatch.setattr(evaluate_script, "fit_all_cutpoints", must_not_refit)
     with caplog.at_level("WARNING"):
-        assert evaluate_script.main(_argv(ckpt_dir, tmp_path, "--split", "test", "--final", "--models", "dynamic_deephit")) == 0
+        assert evaluate_script.main(_argv(ckpt_dir, tmp_path, "--split", "test", "--final", "--models", "dynamic_deephit",
+                                          "--cutpoints", str(val_cutpoints))) == 0
     assert any("one-time final reporting" in r.message for r in caplog.records)
+    results = json.loads((tmp_path / "metrics.json").read_text())
+    saved = json.loads(val_cutpoints.read_text())
+    assert results["split"] == "test" and results["banding"]["refitted_on_this_split"] is False
+    assert results["banding"]["cutpoints"] == saved["models"]  # the validation values, unchanged
+    assert not (tmp_path / "cutpoints.json").exists()  # nothing refitted / re-saved on test
+    for f in ("calibration_table.md", "banding_table.md", "calibration_cvd.png"):
+        assert (tmp_path / f).exists()
+
+
+def test_test_split_refuses_cutpoints_from_other_models(trained, val_cutpoints, tmp_path, capsys):
+    ckpt_dir, _ = trained
+    argv = _argv(ckpt_dir, tmp_path, "--split", "test", "--final", "--models", "tracer", "--cutpoints", str(val_cutpoints))
+    assert evaluate_script.main(argv) == 4
+    assert "no saved cut-points for model" in capsys.readouterr().err
+    assert not (tmp_path / "metrics.json").exists()
+
+
+def test_val_run_never_touches_the_test_split(trained, tmp_path, monkeypatch):
+    ckpt_dir, _ = trained
+    from compass.training.train import Trainer
+
+    real = Trainer.fixed_examples
+    seen_test_ids = []
+
+    def guarded(self, which):
+        assert which != "test", "a validation run asked for test-split examples"
+        seen_test_ids.append(list(self.test_ids))
+        return real(self, which)
+
+    monkeypatch.setattr(Trainer, "fixed_examples", guarded)
+    assert evaluate_script.main(_argv(ckpt_dir, tmp_path, "--models", "dynamic_deephit", "--n-bootstrap", "2")) == 0
+    assert seen_test_ids and all(ids == [] for ids in seen_test_ids)  # Trainers built without test IDs
+
+
+# ---- --final-models ------------------------------------------------------------------------
+
+
+def _final_yaml(tmp_path, ckpt_dir, models=("dynamic_deephit",), split_dir=None):
+    path = tmp_path / "final_models.yaml"
+    path.write_text(yaml.safe_dump({"split_dir": str(split_dir or ckpt_dir / models[0]),
+                                    "models": {m: str(ckpt_dir / m) for m in models}}))
+    return path
+
+
+def test_final_models_loads_the_per_outcome_checkpoints(trained, tmp_path):
+    ckpt_dir, _ = trained
+    cfg = _final_yaml(tmp_path, ckpt_dir)
+    schema, training = _configs()
+    visits, outcomes = generate_synthetic_cohort(n_patients=N_PATIENTS, seed=DATA_SEED)
+    args = evaluate_script.argparse.Namespace(final_models=str(cfg), checkpoint_dir=None, models=None)
+    names, dirs, split = evaluate_script.resolve_models(args, visits, outcomes)
+    assert names == ["dynamic_deephit"] and dirs["dynamic_deephit"] == ckpt_dir / "dynamic_deephit"
+    _, loaded = evaluate_script.load_trained_from("dynamic_deephit", dirs["dynamic_deephit"], split, visits, outcomes,
+                                                  schema, training)
+    assert isinstance(loaded, dict) and set(loaded) == {"mortality", "malo", "cvd"}
+    for o, m in loaded.items():
+        ckpt = torch.load(ckpt_dir / "dynamic_deephit" / f"checkpoint_best_{o}.pt", weights_only=False)
+        assert all(torch.equal(m.state_dict()[k], ckpt["model_state_dict"][k]) for k in ckpt["model_state_dict"])
+    # and end to end through main()
+    out = tmp_path / "out"
+    argv = ["--final-models", str(cfg), "--n-patients", str(N_PATIENTS), "--data-seed", str(DATA_SEED),
+            "--n-bootstrap", "5", "--out-dir", str(out)]
+    assert evaluate_script.main(argv) == 0
+    results = json.loads((out / "metrics.json").read_text())
+    assert results["model_sources"] == {"dynamic_deephit": str(ckpt_dir / "dynamic_deephit")}
+
+
+def test_final_models_refuses_checkpoints_with_other_settings(trained, tmp_path, capsys):
+    import shutil
+
+    ckpt_dir, _ = trained
+    copy = tmp_path / "runs"
+    shutil.copytree(ckpt_dir / "dynamic_deephit", copy / "dynamic_deephit")
+    path = copy / "dynamic_deephit" / "checkpoint_best_malo.pt"
+    ckpt = torch.load(path, weights_only=False)
+    ckpt["optimizer_state_dict"]["param_groups"][0]["weight_decay"] = 0.0
+    torch.save(ckpt, path)
+    cfg = _final_yaml(tmp_path, copy)
+    argv = ["--final-models", str(cfg), "--n-patients", str(N_PATIENTS), "--data-seed", str(DATA_SEED),
+            "--n-bootstrap", "5", "--out-dir", str(tmp_path / "out")]
+    assert evaluate_script.main(argv) == 3
+    assert "weight decay 0" in capsys.readouterr().err
+    assert not (tmp_path / "out" / "metrics.json").exists()
+
+
+def test_checkpoint_dir_and_final_models_are_exclusive(trained, tmp_path):
+    ckpt_dir, _ = trained
+    with pytest.raises(SystemExit):
+        evaluate_script.main(["--checkpoint-dir", str(ckpt_dir), "--final-models", "configs/final_models.yaml"])
 
 
 def test_ipcw_reference_is_the_train_split(trained, monkeypatch):

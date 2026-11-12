@@ -67,10 +67,13 @@ def test_weight_decay_and_learning_rate_reach_adamw(data, tmp_path):
     assert group["weight_decay"] == 1e-3 and group["lr"] == 3e-4
 
 
-def test_default_model_configs_use_adamw_with_zero_weight_decay():
+def test_model_configs_hold_the_locked_final_settings():
+    final = tuning.load_yaml("configs/final_models.yaml")
     for name in BASE_LR:
         cfg = tuning.load_yaml(f"configs/model_{name}.yaml")
-        assert cfg["weight_decay"] == 0.0 and cfg["learning_rate"] == 0.001
+        assert cfg["weight_decay"] == 0.1 and cfg["learning_rate"] == 0.001
+        assert final["models"][name] == f"runs/tune_v2/{name}/lr0.001_wd0.1"
+    assert final["split_dir"] == "runs/tune_v2"
 
 
 def test_train_py_reads_epochs_and_patience_from_config():
