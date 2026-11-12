@@ -1,0 +1,10 @@
+# Pre-specified secondary analysis 1: classical baseline at cohort entry (locked in the analysis
+# plan before the test set was opened). Fitted on the TRAINING split only by
+# scripts/fit_baseline.py; evaluated as model "cox_baseline" by scripts/evaluate.py --baseline.
+#
+# Mortality: Cox proportional hazards (lifelines). MALO, CVD: Fine-Gray with death competing
+# (R survival::finegray + coxph). Fixed ridge penalty, pre-set for numerical stability, NOT tuned:
+# lifelines penalizer 0.01 (n * 0.01 / 2 * ||beta||^2 on the summed log partial likelihood);
+# R ridge theta = 0.01 * n, the same penalty on the same scale.
+penalizer: 0.01
+fit_path: runs/baseline/cox_baseline.json   # git-ignored; aggregates only

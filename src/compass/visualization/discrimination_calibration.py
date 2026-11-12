@@ -10,6 +10,7 @@ _MODEL_COLORS = {
     "dynamic_deephit": "#1f77b4",
     "tracer": "#ff7f0e",
     "survlatent_ode": "#2ca02c",
+    "cox_baseline": "#6E6E6E",
 }
 
 

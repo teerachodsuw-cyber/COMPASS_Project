@@ -32,6 +32,13 @@ fingerprint) is loaded, never re-derived; the data given must match its fingerpr
 validation split the Trainers are given an EMPTY test list, so no test patient is landmarked,
 scaled or predicted. --split test requires --final (one-time final reporting) and --cutpoints.
 
+Classical baseline (--baseline runs/baseline/cox_baseline.json, from scripts/fit_baseline.py,
+fitted on the training split only): evaluated as model "cox_baseline" on the same examples, with the
+same metrics, calibration and paired bootstrap (it is listed first, so every pairwise row reads
+"<deep model>_minus_cox_baseline"). Nothing is refitted here. It is never banded: risk banding
+uses the deep models only. --skip-banding leaves banding out altogether (no cut-points fitted,
+loaded or saved; --cutpoints then not needed on the test split).
+
 Writes to <out-dir> (outputs/ is git-ignored): metrics.json, metrics_table.md,
 calibration_table.md, banding_table.md, calibration_<outcome>.png, and cutpoints.json (val).
 """
@@ -66,6 +73,8 @@ from compass.evaluation.risk_banding import (
     summarise_all_bands,
 )
 from compass.models.base import OUTCOME_NAMES
+from compass.models.cox_baseline import MODEL_NAME as BASELINE_NAME
+from compass.models.cox_baseline import CoxBaselineModel, load_fit
 from compass.models.registry import MODEL_REGISTRY, build_model
 from compass.training.train import Trainer, load_selected_models, outcome_checkpoints
 from compass.visualization.calibration_plot import save_calibration_plots
@@ -207,6 +216,9 @@ def main(argv=None) -> int:
     p.add_argument("--data-seed", type=int, default=None, help="Synthetic only; checked against the saved fingerprint.")
     p.add_argument("--n-bootstrap", type=int, default=1000)
     p.add_argument("--bootstrap-seed", type=int, default=None, help="Defaults to configs/training.yaml's seed.")
+    p.add_argument("--baseline", default=None,
+                   help="Fitted classical baseline (scripts/fit_baseline.py); evaluated as model 'cox_baseline'.")
+    p.add_argument("--skip-banding", action="store_true", help="Leave risk banding out (no cut-points fitted or loaded).")
     p.add_argument("--out-dir", default="outputs")
     args = p.parse_args(argv)
 
@@ -214,7 +226,7 @@ def main(argv=None) -> int:
         if not args.final:
             print("refusing: --split test requires --final (the test split is for ONE-TIME final reporting)", file=sys.stderr)
             return 2
-        if not args.cutpoints:
+        if not args.cutpoints and not args.skip_banding:
             print("refusing: --split test requires --cutpoints (the validation run's cutpoints.json; "
                   "cut-points are never refitted on the test split)", file=sys.stderr)
             return 2
@@ -238,6 +250,16 @@ def main(argv=None) -> int:
         print(f"refusing: {exc}", file=sys.stderr)
         return 3
 
+    baseline_fit = None
+    if args.baseline:
+        baseline_fit = load_fit(args.baseline)
+        problem = ("it was not fitted on the training split" if baseline_fit.get("fitted_on_split") != "train"
+                   else "different split seed" if baseline_fit.get("split_seed") != int(split["seed"])
+                   else "different data" if baseline_fit.get("data_fingerprint") != split["fingerprint"] else None)
+        if problem:
+            print(f"refusing: baseline {args.baseline}: {problem}", file=sys.stderr)
+            return 3
+
     horizon = int(training_config["horizons"]["primary"])
     meta = {
         "fitted_on_split": "val",
@@ -249,7 +271,7 @@ def main(argv=None) -> int:
         "min_band_fraction": DEFAULT_MIN_BAND_FRACTION,
     }
     saved_cutpoints = None
-    if args.split == "test":  # load (and check) the validation cut-points BEFORE any test-split work
+    if args.split == "test" and not args.skip_banding:  # load (and check) the validation cut-points BEFORE any test-split work
         try:
             saved_cutpoints = load_cutpoints(args.cutpoints, meta, names)
         except CutpointsMismatchError as exc:
@@ -262,40 +284,50 @@ def main(argv=None) -> int:
     for m in names:
         trainers[m], models[m] = load_trained_from(m, model_dirs[m], trainer_split, visits_df, outcomes_df, schema,
                                                    training_config)
+    if baseline_fit is not None:  # listed first; predicts from the same collated examples as the deep models
+        trainers = {BASELINE_NAME: trainers[names[0]], **trainers}
+        models = {BASELINE_NAME: CoxBaselineModel(baseline_fit), **models}
 
     bootstrap_seed = args.bootstrap_seed if args.bootstrap_seed is not None else int(training_config["seed"])
     collected = collect_predictions(trainers, models, args.split, horizon)
     _, ground_truth, predictions = collected
     results = evaluate_models(trainers, models, args.split, horizon, args.n_bootstrap, bootstrap_seed, collected=collected)
     results["data"] = "real (processed)" if args.data else "synthetic"
-    results["model_sources"] = meta["model_sources"]
+    results["model_sources"] = dict(meta["model_sources"])
+    if baseline_fit is not None:
+        results["model_sources"][BASELINE_NAME] = os.path.normpath(str(args.baseline))
 
     calibration = calibration_all(predictions, ground_truth, horizon)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    if args.split == "val":
-        cutpoints = fit_all_cutpoints(predictions, ground_truth, horizon)
-        save_cutpoints(out / CUTPOINTS_FILE, _jsonable(cutpoints), meta)
-        cutpoints_source = str(out / CUTPOINTS_FILE)
-    else:
-        cutpoints = saved_cutpoints
-        cutpoints_source = args.cutpoints
-    bands = summarise_all_bands(predictions, ground_truth, cutpoints, horizon)
     results["calibration"] = calibration
-    results["banding"] = {"cutpoints_source": cutpoints_source, "refitted_on_this_split": args.split == "val",
-                          "cutpoints": cutpoints, "bands": bands}
-    plots = save_calibration_plots(calibration, OUTCOME_NAMES, out)
-
     tables = {
         "metrics_table.md": format_tables(results),
         "calibration_table.md": format_calibration_tables(calibration),
-        "banding_table.md": format_banding_tables(cutpoints, bands, args.split),
     }
+    if args.skip_banding:
+        results["banding"] = {"skipped": True}
+    else:
+        deep_predictions = {m: predictions[m] for m in names}  # the baseline is never banded
+        if args.split == "val":
+            cutpoints = fit_all_cutpoints(deep_predictions, ground_truth, horizon)
+            save_cutpoints(out / CUTPOINTS_FILE, _jsonable(cutpoints), meta)
+            cutpoints_source = str(out / CUTPOINTS_FILE)
+        else:
+            cutpoints = saved_cutpoints
+            cutpoints_source = args.cutpoints
+        bands = summarise_all_bands(deep_predictions, ground_truth, cutpoints, horizon)
+        results["banding"] = {"cutpoints_source": cutpoints_source, "refitted_on_this_split": args.split == "val",
+                              "cutpoints": cutpoints, "bands": bands}
+        tables["banding_table.md"] = format_banding_tables(cutpoints, bands, args.split)
+    plots = save_calibration_plots(calibration, OUTCOME_NAMES, out)
+
     for fname, text in tables.items():
         print(text + "\n")
         (out / fname).write_text(text + "\n")
     (out / "metrics.json").write_text(json.dumps(_jsonable(results), indent=2))
-    written = ["metrics.json", *tables, *(p.name for p in plots)] + ([CUTPOINTS_FILE] if args.split == "val" else [])
+    written = ["metrics.json", *tables, *(p.name for p in plots)]
+    written += [CUTPOINTS_FILE] if args.split == "val" and not args.skip_banding else []
     print(f"wrote to {out}/: " + ", ".join(written))
     return 0
 

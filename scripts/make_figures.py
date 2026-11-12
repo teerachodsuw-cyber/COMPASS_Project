@@ -21,8 +21,9 @@ Outputs in --out-dir (git-ignored): for each figure an editable vector PDF (True
 text kept as text) and a 300-dpi PNG preview:
   fig1_cohort_flow, fig2_cindex, fig3_calibration, fig4_risk_band_curves,
   figS1_pairwise_cindex, figS2_band_hazard_ratios, figS3_ibs.
---include-baseline adds a grey "Cox/Fine-Gray baseline" row (model "baseline" in metrics.json)
-to Fig 2 and S3; off by default.
+--include-baseline adds a grey "Cox/Fine-Gray baseline" row (model "cox_baseline") to Fig 2 and
+S3; off by default. Its rows come from --baseline-eval-dir (scripts/evaluate.py --baseline output,
+e.g. outputs/baseline_test), checked to be the same split, patients, horizon and bootstrap settings.
 
 Style (JHEP Reports): Arial (fallback Liberation Sans / Helvetica), 8 pt text (6.5-7 pt only for
 dense legends / numbers at risk; nothing below 6 pt), sentence case, no full stops; panel letters
@@ -58,7 +59,7 @@ MODEL_STYLE = {
     "dynamic_deephit": {"label": "Dynamic-DeepHit", "color": "#0072B2", "marker": "o"},
     "tracer": {"label": "TraCeR", "color": "#D55E00", "marker": "s"},
     "survlatent_ode": {"label": "SurvLatent ODE", "color": "#009E73", "marker": "^"},
-    "baseline": {"label": "Cox/Fine-Gray baseline", "color": "#6E6E6E", "marker": "D"},
+    "cox_baseline": {"label": "Cox/Fine-Gray baseline", "color": "#6E6E6E", "marker": "D"},
 }
 BAND_STYLE = (
     {"label": "Low", "short": "Low", "color": "#9E8CC9", "ls": "-"},
@@ -110,9 +111,10 @@ def _models_in(results: dict, include_baseline: bool) -> list[str]:
     present = {r["model"] for r in results["per_model"]}
     models = [m for m in MODELS if m in present]
     if include_baseline:
-        if "baseline" not in present:
-            raise FigureDataError("--include-baseline: metrics.json has no 'baseline' model results yet")
-        models.append("baseline")
+        if "cox_baseline" not in present:
+            raise FigureDataError("--include-baseline: no 'cox_baseline' model results (pass --baseline-eval-dir, "
+                                  "e.g. outputs/baseline_test)")
+        models.append("cox_baseline")
     return models
 
 
@@ -254,7 +256,7 @@ def fig_metric_forest(results: dict, metric: str, include_baseline: bool):
     models = _models_in(results, include_baseline)
     labels = CINDEX_LABEL if metric == "cindex" else IBS_LABEL
     fig, axes = plt.subplots(1, 3, figsize=(FULL_WIDTH, (58 + 4 * len(models)) * MM), sharey=True)
-    fig.subplots_adjust(left=0.15, right=0.98, top=0.86, bottom=0.36, wspace=0.12)
+    fig.subplots_adjust(left=0.205 if include_baseline else 0.15, right=0.98, top=0.86, bottom=0.36, wspace=0.12)
     ys = np.arange(len(models))[::-1]
     lo_all, hi_all = [], []
     for ax, outcome in zip(axes, OUTCOMES):
@@ -566,9 +568,24 @@ def fig_band_hazard_ratios(results: dict):
 # ---- main -----------------------------------------------------------------------------------
 
 
-def make_all(eval_dir, out_dir, flow_path, split_path, assignments_path, include_baseline: bool = False) -> list[Path]:
+def merge_baseline_rows(results: dict, baseline_results: dict) -> dict:
+    """results with the cox_baseline per-model rows of another evaluation of the SAME split,
+    patients, horizon and bootstrap draws added (deep-model rows are not touched)."""
+    for key in ("split", "n_patients", "horizon_years", "n_bootstrap", "bootstrap_seed"):
+        if results.get(key) != baseline_results.get(key):
+            raise FigureDataError(f"--baseline-eval-dir differs from --eval-dir in '{key}'")
+    rows = [r for r in baseline_results["per_model"] if r["model"] == "cox_baseline"]
+    if not rows:
+        raise FigureDataError("--baseline-eval-dir has no 'cox_baseline' results")
+    return {**results, "per_model": [r for r in results["per_model"] if r["model"] != "cox_baseline"] + rows}
+
+
+def make_all(eval_dir, out_dir, flow_path, split_path, assignments_path, include_baseline: bool = False,
+             baseline_eval_dir=None) -> list[Path]:
     eval_dir, out_dir = Path(eval_dir), Path(out_dir)
     results = json.loads((eval_dir / "metrics.json").read_text())
+    if include_baseline and baseline_eval_dir:
+        results = merge_baseline_rows(results, json.loads((Path(baseline_eval_dir) / "metrics.json").read_text()))
     flow = json.loads(Path(flow_path).read_text())
     split = json.loads(Path(split_path).read_text())
     assignments = pd.read_csv(assignments_path)
@@ -592,11 +609,12 @@ def main(argv=None) -> int:
     p.add_argument("--flow", default="data/processed/flow_log.json")
     p.add_argument("--split-file", default="runs/tune_v2/split.json", help="Only the number of IDs per split is read.")
     p.add_argument("--band-assignments", default="runs/final_test/band_assignments.csv")
-    p.add_argument("--include-baseline", action="store_true", help="Grey baseline row in Fig 2 / S3 (model 'baseline').")
+    p.add_argument("--include-baseline", action="store_true", help="Grey baseline row in Fig 2 / S3 (model 'cox_baseline').")
+    p.add_argument("--baseline-eval-dir", default=None, help="Evaluation dir holding the cox_baseline results.")
     args = p.parse_args(argv)
     try:
         paths = make_all(args.eval_dir, args.out_dir, args.flow, args.split_file, args.band_assignments,
-                         args.include_baseline)
+                         args.include_baseline, args.baseline_eval_dir)
     except FigureDataError as exc:
         print(f"refusing: {exc}", file=sys.stderr)
         return 3

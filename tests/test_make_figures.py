@@ -129,7 +129,7 @@ def test_tampered_assignments_are_refused(synthetic_outputs, tmp_path, capsys):
 
 def test_include_baseline_refuses_without_baseline_results(synthetic_outputs, tmp_path, capsys):
     assert figures.main(_argv(synthetic_outputs, tmp_path / "out", "--include-baseline")) == 3
-    assert "no 'baseline' model" in capsys.readouterr().err
+    assert "no 'cox_baseline' model results" in capsys.readouterr().err
 
 
 def test_flow_counts_must_add_up(synthetic_outputs):
@@ -147,3 +147,27 @@ def test_overlap_check_catches_overlapping_text():
     ax.text(0.5, 0.5, "another label")
     assert any(p.startswith("overlap") for p in figures.text_problems(fig))
     plt.close(fig)
+
+
+def test_include_baseline_draws_the_grey_baseline_row(synthetic_outputs, tmp_path):
+    results = json.loads((synthetic_outputs["test"] / "metrics.json").read_text())
+    base = dict(results)  # a stand-in baseline evaluation of the same split: one model's rows relabelled
+    base["per_model"] = [{**r, "model": "cox_baseline"} for r in results["per_model"] if r["model"] == "tracer"]
+    (tmp_path / "base").mkdir()
+    (tmp_path / "base" / "metrics.json").write_text(json.dumps(base))
+    merged = figures.merge_baseline_rows(results, base)
+    import matplotlib.pyplot as plt
+    plt.rcParams.update(figures.STYLE)
+    for metric in ("cindex", "ibs"):
+        fig = figures.fig_metric_forest(merged, metric, include_baseline=True)
+        labels = [t.get_text() for t in fig.axes[0].get_yticklabels()]
+        assert labels[-1] == "Cox/Fine-Gray baseline" and len(labels) == 4
+        grey = [l for ax in fig.axes for l in ax.lines if l.get_color() == "#6E6E6E" and l.get_marker() == "D"]
+        assert len(grey) == 3  # one grey diamond per panel
+        plt.close(fig)
+    out = tmp_path / "figs"
+    assert figures.main(_argv(synthetic_outputs, out, "--include-baseline", "--baseline-eval-dir", str(tmp_path / "base"))) == 0
+    assert (out / "fig2_cindex.pdf").exists() and (out / "figS3_ibs.png").exists()
+    base["n_patients"] += 1
+    with pytest.raises(figures.FigureDataError, match="n_patients"):
+        figures.merge_baseline_rows(results, base)
